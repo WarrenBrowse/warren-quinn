@@ -68,3 +68,25 @@ users are unaffected.
 
 The fork already ships these names, so if upstream merges, downstream migration
 is a version bump, not a rewrite.
+
+## Ready-to-submit artifact
+
+`upstream-initial-fragmentation.patch` (in this repo) is the **isolated diff**:
+only the two knobs on clean upstream quinn (quinn-proto config + populate_packet),
+13 hunks, zero GSO/sockbuf/Apple/version noise, zero brand/censorship wording.
+Verified `git apply`-clean on the upstream base (commit `41c8527c`).
+
+Turnkey submit (run by a maintainer who decides to disclose upstream):
+
+```bash
+gh repo fork quinn-rs/quinn --clone --remote
+cd quinn && git checkout 41c8527c -b initial-fragmentation-control
+git apply /path/to/upstream-initial-fragmentation.patch
+git commit -am "transport: configurable Initial-packet padding and CRYPTO-fragment chunking"
+git push -u origin initial-fragmentation-control
+gh pr create --repo quinn-rs/quinn --title "transport: configurable Initial-packet padding and CRYPTO-fragment chunking" --body-file UPSTREAM-PR.md
+```
+
+Deliberately not auto-submitted: opening a PR on the third-party public
+`quinn-rs/quinn` is a one-time disclosure decision (it ties the org to QUIC
+anti-ossification work), so it is left as the single human step above.
