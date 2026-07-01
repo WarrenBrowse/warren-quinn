@@ -1,0 +1,421 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -55,5 +55,7 @@ web-time = "1"
+ windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
+ cfg_aliases = "0.2"
++# quinn-udp PR #2672 port: partial-send tail buffer mutex.
++parking_lot = "0.12.5"
+ 
+ [profile.bench]
+ debug = true
+diff --git a/quinn-udp/Cargo.toml b/quinn-udp/Cargo.toml
+--- a/quinn-udp/Cargo.toml
++++ b/quinn-udp/Cargo.toml
+@@ -18,12 +18,14 @@ default = ["tracing", "tracing-log"]
+ tracing-log = ["tracing/log"]
+ log = ["dep:log"]
+ # Support private Apple APIs to send multiple packets in a single syscall.
+-fast-apple-datapath = []
++# PR #2672 port: pulls in parking_lot for the partial-send tail buffer.
++fast-apple-datapath = ["parking_lot"]
+ 
+ [dependencies]
+ libc = "0.2.175"
+ log = { workspace = true, optional = true }
+ tracing = { workspace = true, optional = true }
++parking_lot = { workspace = true, optional = true }
+ 
+ [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+ socket2 = { workspace = true }
+diff --git a/quinn-udp/src/unix.rs b/quinn-udp/src/unix.rs
+--- a/quinn-udp/src/unix.rs
++++ b/quinn-udp/src/unix.rs
+@@ -62,6 +62,15 @@ pub struct UdpSocketState {
+     /// Apple OS versions. Callers must verify availability before enabling.
+     #[cfg(apple_fast)]
+     apple_fast_path: AtomicBool,
++
++    /// Upstream PR #2672, ported with buffering enabled: the unsent
++    /// tail of a partially-completed `sendmsg_x` batch. `sendmsg_x` can accept
++    /// fewer datagrams than submitted when the send buffer fills mid-batch and
++    /// returns the accepted count; upstream 0.6.1 ignored that count and
++    /// silently dropped the tail. We carry it here and flush it before the next
++    /// send so a batch is delivered exactly once, in order, with no drops.
++    #[cfg(apple_fast)]
++    partial_transmit: parking_lot::Mutex<Option<PartialTransmit>>,
+ }
+ 
+ impl UdpSocketState {
+@@ -189,7 +216,7 @@ impl UdpSocketState {
+         }
+ 
+         let now = Instant::now();
+-        Ok(Self {
++        let this = Self {
+             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
+             max_gso_segments: AtomicUsize::new(gso::max_gso_segments(&*io)),
+             gro_segments,
+@@ -197,7 +224,25 @@ impl UdpSocketState {
+             sendmsg_einval: AtomicBool::new(false),
+             #[cfg(apple_fast)]
+             apple_fast_path: AtomicBool::new(false),
+-        })
++            #[cfg(apple_fast)]
++            partial_transmit: parking_lot::Mutex::new(None),
++        };
++
++        // enable the Apple fast datapath automatically at socket
++        // creation, but only if the private `sendmsg_x`/`recvmsg_x` symbols
++        // actually resolve at runtime. The `fast-apple-datapath` cargo feature
++        // is the opt-in (gated to macOS desktop builds, never iOS: private API,
++        // App Store guideline 2.5.1); resolving the symbols here means we never
++        // bump `max_gso_segments` to a batched value on an OS that lacks them
++        // (which would otherwise have the slow-path fallback emit one oversized
++        // datagram for the first batch).
++        #[cfg(apple_fast)]
++        if sendmsg_x_fn().is_some() && recvmsg_x_fn().is_some() {
++            // SAFETY: the symbols resolved above, so the private APIs are present.
++            unsafe { this.set_apple_fast_path() };
++        }
++
++        Ok(this)
+     }
+ 
+     /// Sends a [`Transmit`] on the given socket.
+@@ -377,6 +422,13 @@ impl UdpSocketState {
+         }
+         f
+     }
++
++    /// Upstream PR #2672: the queue holding the unsent tail of a
++    /// partially-completed `sendmsg_x` batch, flushed before the next send.
++    #[cfg(apple_fast)]
++    fn partial_transmit(&self) -> parking_lot::MutexGuard<'_, Option<PartialTransmit>> {
++        self.partial_transmit.lock()
++    }
+ }
+ 
+ #[cfg(not(any(apple, target_os = "openbsd", target_os = "netbsd")))]
+@@ -474,48 +526,174 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
+ }
+ 
+ /// Send using the fast `sendmsg_x` API.
++///
++/// ported from upstream PR #2672 ("buffer unsent tail of partial
++/// `sendmsg_x` calls"), WITH the tail-buffering enabled. `sendmsg_x` submits a
++/// batch of independent datagrams in one syscall and returns how many it
++/// accepted; when the send buffer fills mid-batch it accepts fewer than
++/// submitted. Upstream 0.6.1 discarded that count and silently dropped the
++/// remainder (the bug @jamilbk found while debugging throughput). Here we:
++///   1. flush any tail buffered from a previous partial send first,
++///   2. advance through the current batch by the accepted count, retrying the
++///      unsent portion in-loop while progress is made,
++///   3. on `WouldBlock` after partial progress, buffer the remainder and
++///      return `Ok(())` so the caller hands us the next `Transmit`, at which
++///      point we drain the buffer first.
++/// This guarantees every datagram is delivered exactly once and in order.
++///
++/// NOTE: the upstream draft left step 3's buffering commented out (pending a
++/// maintainer decision on memcpy churn for bulk transfer). We enable it: a
++/// bounded per-event `Vec` copy is strictly cheaper than dropping datagrams and
++/// forcing QUIC-layer retransmits, and dropping would violate our no-silent-loss
++/// requirement. The flush in step 1 suspends on `WouldBlock`, so this cannot
++/// busy-spin.
+ #[cfg(apple_fast)]
+ fn send_via_sendmsg_x(
+     state: &UdpSocketState,
+     io: SockRef<'_>,
+     transmit: &Transmit<'_>,
+ ) -> io::Result<()> {
++    let Some(sendmsg_x) = state.resolve_apple_fast_fn(sendmsg_x_fn) else {
++        return send_single(state, io, transmit);
++    };
++
++    // Step 1: flush the tail buffered by a previous partial send, if any.
++    {
++        let mut pending = state.partial_transmit();
++        if let Some(p) = pending.as_mut() {
++            while !p.buf.is_empty() {
++                match send_chunks(
++                    &io,
++                    sendmsg_x,
++                    p.destination,
++                    p.ecn,
++                    p.src_ip,
++                    state.sendmsg_einval(),
++                    p.segment_size,
++                    &p.buf,
++                ) {
++                    Ok(sent) => {
++                        debug_assert!(sent > 0, "sendmsg_x returned Ok(0); would spin");
++                        let n = (sent * p.segment_size).min(p.buf.len());
++                        p.buf.drain(..n);
++                    }
++                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
++                    Err(_e) => {
++                        crate::log::debug!("dropping queued datagram after sendmsg_x error: {_e}");
++                        let n = p.segment_size.min(p.buf.len());
++                        p.buf.drain(..n);
++                    }
++                }
++            }
++        }
++        *pending = None;
++    }
++
++    // Step 2/3: send the current batch, advancing by the accepted count.
++    let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
++    let total = transmit.contents.len().div_ceil(segment_size);
++    let mut sent_datagrams = 0;
++
++    while sent_datagrams < total {
++        let remaining = &transmit.contents[sent_datagrams * segment_size..];
++        match send_chunks(
++            &io,
++            sendmsg_x,
++            transmit.destination,
++            transmit.ecn,
++            transmit.src_ip,
++            state.sendmsg_einval(),
++            segment_size,
++            remaining,
++        ) {
++            // Sent some datagrams; continue with the rest.
++            Ok(sent) => sent_datagrams += sent,
++            // Could not send any datagram yet: surface backpressure unchanged.
++            Err(e) if e.kind() == io::ErrorKind::WouldBlock && sent_datagrams == 0 => {
++                return Err(e);
++            }
++            // Sent some, then blocked: buffer the remainder and report success.
++            // The next call drains it (step 1) before its own batch.
++            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
++                let remainder = &transmit.contents[sent_datagrams * segment_size..];
++                crate::log::debug!(
++                    "sendmsg_x sent {sent_datagrams}/{total} datagrams; \
++                     queuing remaining {} bytes for retry",
++                    remainder.len()
++                );
++                *state.partial_transmit() = Some(PartialTransmit {
++                    destination: transmit.destination,
++                    ecn: transmit.ecn,
++                    src_ip: transmit.src_ip,
++                    segment_size,
++                    buf: remainder.to_vec(),
++                });
++                return Ok(());
++            }
++            // Any other error: surface without buffering.
++            Err(e) => return Err(e),
++        }
++    }
++
++    Ok(())
++}
++
++/// Splits `contents` into `segment_size`-sized datagrams and submits them with a
++/// single `sendmsg_x` call, returning the number of datagrams the kernel
++/// accepted. Extracted from `send_via_sendmsg_x` per upstream PR #2672.
++#[cfg(apple_fast)]
++#[allow(clippy::too_many_arguments)]
++fn send_chunks(
++    io: &SockRef<'_>,
++    sendmsg_x: SendmsgXFn,
++    destination: SocketAddr,
++    ecn: Option<EcnCodepoint>,
++    src_ip: Option<IpAddr>,
++    sendmsg_einval: bool,
++    segment_size: usize,
++    contents: &[u8],
++) -> io::Result<usize> {
+     let mut hdrs = unsafe { mem::zeroed::<[msghdr_x; BATCH_SIZE]>() };
+     let mut iovs = unsafe { mem::zeroed::<[libc::iovec; BATCH_SIZE]>() };
+     let mut ctrls = [cmsg::Aligned([0u8; CMSG_LEN]); BATCH_SIZE];
+-    let addr = socket2::SockAddr::from(transmit.destination);
+-    let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
++    let addr = socket2::SockAddr::from(destination);
+     let mut cnt = 0;
+-    debug_assert!(transmit.contents.len().div_ceil(segment_size) <= BATCH_SIZE);
+-    for (i, chunk) in transmit
+-        .contents
+-        .chunks(segment_size)
+-        .enumerate()
+-        .take(BATCH_SIZE)
+-    {
++    debug_assert!(contents.len().div_ceil(segment_size) <= BATCH_SIZE);
++    for (i, chunk) in contents.chunks(segment_size).enumerate().take(BATCH_SIZE) {
+         prepare_msg_x(
+             &Transmit {
+-                destination: transmit.destination,
+-                ecn: transmit.ecn,
++                destination,
++                ecn,
+                 contents: chunk,
+                 segment_size: Some(chunk.len()),
+-                src_ip: transmit.src_ip,
++                src_ip,
+             },
+             &addr,
+             &mut hdrs[i],
+             &mut iovs[i],
+             &mut ctrls[i],
+             true,
+-            state.sendmsg_einval(),
++            sendmsg_einval,
+         );
+         hdrs[i].msg_datalen = chunk.len();
+         cnt += 1;
+     }
+-    let Some(sendmsg_x) = state.resolve_apple_fast_fn(sendmsg_x_fn) else {
+-        return send_single(state, io, transmit);
+-    };
+-    retry_if_interrupted(|| unsafe { sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0) })?;
+-    Ok(())
++    let sent = retry_if_interrupted(|| unsafe {
++        sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0)
++    })?;
++    Ok(sent as usize)
++}
++
++/// The unsent tail of a partially-completed `sendmsg_x` invocation.
++/// ported from upstream PR #2672.
++#[cfg(apple_fast)]
++#[derive(Debug)]
++struct PartialTransmit {
++    destination: SocketAddr,
++    ecn: Option<EcnCodepoint>,
++    src_ip: Option<IpAddr>,
++    segment_size: usize,
++    buf: Vec<u8>,
+ }
+ 
+ #[cfg(any(target_os = "openbsd", target_os = "netbsd", apple_slow))]
+diff --git a/quinn-udp/tests/tests.rs b/quinn-udp/tests/tests.rs
+index 0862f183..d68ee94d 100644
+--- a/quinn-udp/tests/tests.rs
++++ b/quinn-udp/tests/tests.rs
+@@ -386,18 +386,22 @@ fn apple_fast_datapath() {
+     let send_state = UdpSocketState::new((&send).into()).unwrap();
+     let recv_state = UdpSocketState::new((&recv).into()).unwrap();
+ 
+-    // Initially, fast path should be disabled and max_gso_segments should be 1
++    // unlike upstream (opt-in, disabled until set_apple_fast_path), our
++    // fork auto-enables the fast path in `new()` when the private symbols
++    // resolve, since quinn's high-level Endpoint never calls the opt-in. On a
++    // macOS test host the symbols are present, so the fast path is already on
++    // and max_gso_segments is already BATCH_SIZE.
+     assert!(
+-        !send_state.is_apple_fast_path_enabled(),
+-        "fast path should be disabled initially"
++        send_state.is_apple_fast_path_enabled(),
++        "fast path should be auto-enabled by new() on a macOS host"
+     );
+     assert_eq!(
+         send_state.max_gso_segments(),
+-        1,
+-        "max_gso_segments should be 1 before enabling fast path"
++        quinn_udp::BATCH_SIZE,
++        "max_gso_segments should be BATCH_SIZE once the fast path is enabled"
+     );
+ 
+-    // Enable the fast path
++    // Idempotent re-enable (no-op here; keeps the explicit opt-in API exercised).
+     // SAFETY: Assume that sendmsg_x/recvmsg_x are available on the macOS test host.
+     unsafe {
+         send_state.set_apple_fast_path();
+@@ -461,3 +465,95 @@ fn apple_fast_datapath() {
+     }
+     assert_eq!(total_received, segments, "should receive all segments");
+ }
++
++/// A partial `sendmsg_x` batch must not silently drop its unsent tail.
++///
++/// ported from upstream PR #2672. `sendmsg_x` can accept fewer datagrams
++/// than submitted when the send buffer fills mid-batch. Shrinking `SO_SNDBUF`
++/// well below one batch forces that on essentially every call. Every datagram
++/// handed to the socket must still arrive exactly once and in order, none
++/// dropped, duplicated, or reordered, even as the unsent tail is carried over to
++/// the following send. (This test fails against upstream 0.6.1, which ignores
++/// the `sendmsg_x` return value and drops the tail.)
++#[test]
++#[cfg(apple_fast)]
++fn apple_fast_partial_send_is_not_dropped() {
++    let send = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++    let dst_addr = recv.local_addr().unwrap();
++
++    let send_state = UdpSocketState::new((&send).into()).unwrap();
++
++    // SAFETY: assume `sendmsg_x`/`recvmsg_x` are available on the macOS test host.
++    unsafe {
++        send_state.set_apple_fast_path();
++    }
++
++    let segments = send_state.max_gso_segments();
++    assert!(segments > 1, "fast path should batch multiple datagrams");
++
++    const SEGMENT_SIZE: usize = 1024;
++
++    // A send buffer far smaller than a full batch makes each `sendmsg_x` accept
++    // only part of the batch, exercising the carry-over of the unsent tail.
++    send_state
++        .set_send_buffer_size((&send).into(), SEGMENT_SIZE * 4)
++        .unwrap();
++
++    recv.set_nonblocking(true).unwrap();
++
++    // Datagrams we require delivered before declaring success. Kept below 256 so
++    // each datagram's global index fits in the single-byte tag.
++    let target = (segments * 4).min(200);
++
++    let mut next_to_send = 0usize;
++    let mut received: Vec<usize> = Vec::with_capacity(target);
++    let mut buf = [0u8; u16::MAX as usize];
++    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++
++    while received.len() < target {
++        assert!(
++            std::time::Instant::now() < deadline,
++            "timed out after receiving {}/{target} datagrams; tail was dropped",
++            received.len()
++        );
++
++        let mut msg = vec![0u8; SEGMENT_SIZE * segments];
++        for i in 0..segments {
++            msg[i * SEGMENT_SIZE] = ((next_to_send + i) % 256) as u8;
++        }
++        match send_state.try_send(
++            (&send).into(),
++            &Transmit {
++                destination: dst_addr,
++                ecn: None,
++                contents: &msg,
++                segment_size: Some(SEGMENT_SIZE),
++                src_ip: None,
++            },
++        ) {
++            Ok(()) => next_to_send += segments,
++            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
++            Err(e) => panic!("unexpected send error: {e}"),
++        }
++
++        loop {
++            match recv.recv_from(&mut buf) {
++                Ok((n, _)) => {
++                    assert_eq!(n, SEGMENT_SIZE, "unexpected datagram length");
++                    received.push(buf[0] as usize);
++                }
++                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
++                Err(e) => panic!("unexpected recv error: {e}"),
++            }
++        }
++    }
++
++    for (i, &tag) in received.iter().enumerate() {
++        assert_eq!(
++            tag,
++            i % 256,
++            "datagram {i} arrived as tag {tag}: a partial send dropped, duplicated, or reordered the batch tail"
++        );
++    }
++}

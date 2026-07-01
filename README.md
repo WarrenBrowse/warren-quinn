@@ -41,4 +41,38 @@ quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-
    channel. Matters here because the GSO sizing above amplifies exactly that
    busy-channel case.
 
+## Patch files (portable form of the deltas)
+
+Each fork delta is also committed as an isolated patch at the repo root, so it
+survives a move to a fresh upstream base even though this repo's history cannot
+be `git rebase`d (the fork root is an orphan commit with no ancestry shared
+with the upstream tags):
+
+- `upstream-initial-fragmentation.patch`: the two Initial-fragmentation knobs,
+  the only delta proposed for upstream (see `UPSTREAM-PR.md`). Applies on
+  upstream commit `41c8527c`.
+- `fork-gso.patch`: GSO transmit sizing in `quinn/src/connection.rs`
+  (fork-local). Applies on tag `quinn-0.11.11`.
+- `fork-windows-sockbuf.patch`: kernel socket-buffer auto-sizing at socket
+  creation, `quinn-udp/src/windows.rs` plus the matching `unix.rs` hunk
+  (fork-local). Applies on tag `quinn-udp-0.6.1`.
+- `fork-apple-datapath.patch`: the PR #2672 port (partial `sendmsg_x` tail
+  buffering, auto-enable via `dlsym`) in `quinn-udp/src/unix.rs`, its
+  `parking_lot` feature wiring, and its tests (fork-local). Applies on tag
+  `quinn-udp-0.6.1`.
+
+The `fork-` prefix marks deltas that stay fork-local per `UPSTREAM-PR.md`;
+only the `upstream-` patch is intended for submission.
+
+**Rebase-onto-fresh-tag strategy.** To move the fork to a new upstream release:
+check out the new upstream tag into a fresh tree, re-apply the crate identity
+(package names `warren-quinn*`, `[lib]` names, `-fork.<N>` version suffix, this
+README/patch set), then `git apply` each patch file, fixing drift by hand where
+upstream refactored (for example, upstream extracted the Apple fast path into
+its own module after `quinn-udp-0.6.1`, so `fork-apple-datapath.patch` needs
+manual porting there). Finally regenerate every patch from the new base
+(`git diff <new-tag> HEAD -- <paths>`) so the next rebase starts clean, and run
+the proto test suite (`cargo test -p warren-quinn-proto`), which covers the two
+knobs in-fork.
+
 Licensed `MIT OR Apache-2.0`, same as upstream quinn.
