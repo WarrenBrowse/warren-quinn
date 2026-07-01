@@ -1,6 +1,9 @@
 [package]
 name = "warren-quinn"
-version = "0.11.11"
+# Same `<upstream-base>-fork.<N>` scheme as warren-quinn-proto, bumped in
+# lockstep so the manifest reflects the fork level. Upstream base: quinn
+# 0.11.11 (tag `quinn-0.11.11`, same commit as `quinn-proto-0.11.15`).
+version = "0.11.11-fork.7"
 license.workspace = true
 repository.workspace = true
 description = "Versatile QUIC transport protocol implementation"
