@@ -16,6 +16,32 @@ The lib names are unchanged, so consumers depend with a package rename and keep
 quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-fork.6", package = "warren-quinn" }
 ```
 
+The next tag will be `v0.11.15-fork.7`; it is cut only after a Hetzner
+real-exit bench validates the CUBIC fast-convergence behavior change folded
+from upstream 0.11.15 (see below). Until then consumers keep pinning
+`v0.11.15-fork.6`.
+
+## Upstream base (no gap)
+
+The fork tree now matches its upstream tags exactly, deltas below aside:
+`quinn-proto-0.11.15`, `quinn-0.11.11` (same release commit `a7499b84`), and
+`quinn-udp-0.6.1`. In particular the genuine 0.11.15 content is fully folded
+in, including:
+
+- **CUBIC fast-convergence fix** (upstream `fe5ac49f`, RFC 9438): `ssthresh`
+  is derived from the pre-reduction window, no longer double-reducing after
+  fast convergence lowered `w_max`. Behavior change vs fork.6; needs the
+  Hetzner re-bench before the next tag.
+- **Saturation silent-drop** (upstream `6f03ca34`): Initials that would be
+  rejected because `max_incoming` is full or CIDs are exhausted are dropped
+  without deriving initial keys or replying `CONNECTION_REFUSED`, so an
+  Initial flood cannot starve packet processing (regression test
+  `silently_drop_rejected_initials` included).
+- Upstream PR #2694 (RUSTSEC-2026-0185, bounded out-of-order stream
+  reassembly) and PR `c1e903bc` (overdue async timers honoured via
+  `runtime.now()`), previously carried as fork backports, now simply part of
+  the matching base.
+
 ## Deltas vs upstream
 
 1. **Initial-packet fragmentation control** (`TransportConfig::initial_datagram_min_size`,
@@ -23,23 +49,19 @@ quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-
    datagram(s) to a configurable floor and cap the first CRYPTO fragment so the
    handshake spans two or more UDP datagrams. Anti-ossification; defaults are
    no-ops (RFC 9000 floor / no fragmentation). Spec-compliant (RFC 9000 sect 7.5).
+   The padding floor is clamped to the RFC 9000 minimum from below and to the
+   current path MTU from above (an over-MTU floor previously emitted an
+   undeliverable datagram and stalled the handshake; raise
+   `TransportConfig::initial_mtu` alongside the floor to go past 1200). Both
+   knobs are covered in-fork by sans-io pair tests in `quinn-proto/src/tests`
+   (`initial_datagram_min_size_*`, `initial_crypto_first_fragment_*`),
+   including the defaults-match-upstream and above-MTU-clamp cases.
 2. **GSO transmit sizing**: `MAX_TRANSMIT_DATAGRAMS` 20 -> 80,
    `MAX_TRANSMIT_SEGMENTS` 10 -> 40, send-buffer pre-allocation.
-3. **Socket buffer sizing** on unix and windows (Windows closes a gap upstream
-   only handles on unix).
+3. **Socket buffer sizing**: kernel send/recv buffers auto-sized at socket
+   creation on unix and windows (upstream only exposes manual setters).
 4. **Apple fast datapath** (quinn-udp): upstream PR #2672 partial-send tail
    buffering, ported with buffering enabled, auto-enabled when symbols resolve.
-5. **Security backport** (quinn-proto -> 0.11.15): upstream PR #2694
-   (RUSTSEC-2026-0185) bounds out-of-order stream reassembly. `Assembler::insert`
-   yields `TooManyChunks` past 1024 buffered chunks, mapped to a connection
-   `INTERNAL_ERROR`, so a peer sending maliciously gapped frames can no longer
-   exhaust receiver memory.
-6. **Timer correctness backport** (quinn -> 0.11.11): upstream PR `c1e903bc`
-   detects deadline expiry via `runtime.now()` instead of polling the async
-   timer, so a PTO / loss-detection / idle deadline is honoured even when
-   Tokio's cooperative budget is exhausted while draining a busy conn-event
-   channel. Matters here because the GSO sizing above amplifies exactly that
-   busy-channel case.
 
 ## Patch files (portable form of the deltas)
 
