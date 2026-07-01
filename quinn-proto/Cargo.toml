@@ -3,8 +3,8 @@ name = "warren-quinn-proto"
 # The `-fork.<N>` pre-release suffix locks the workspace `[patch.crates-io]`
 # entry to this fork. Bump the trailing integer on every fork-side patch so a
 # stale `Cargo.lock` cannot silently drag the upstream crate back in. Base:
-# upstream 0.11.x tip (0.11.14, GHSA-6xvm-j4wr-6v98 fix) + quinn-udp 0.6.1.
-version = "0.11.15-fork.6"
+# full upstream quinn-proto 0.11.15 (tag `quinn-proto-0.11.15`) + quinn-udp 0.6.1.
+version = "0.11.15-fork.7"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
