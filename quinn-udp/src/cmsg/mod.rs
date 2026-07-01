@@ -1,5 +1,6 @@
 use std::{
-    ffi::{c_int, c_uchar}, ptr,
+    ffi::{c_int, c_uchar},
+    ptr,
 };
 
 #[cfg(unix)]
@@ -51,11 +52,7 @@ impl<'a, M: MsgHdr> Encoder<'a, M> {
             self.hdr.control_len()
         );
         let cmsg = self.cmsg.take().expect("no control buffer space remaining");
-        cmsg.set(
-            level,
-            ty,
-            M::ControlMessage::cmsg_len(size_of_val(&value)),
-        );
+        cmsg.set(level, ty, M::ControlMessage::cmsg_len(size_of_val(&value)));
         unsafe {
             ptr::write(cmsg.cmsg_data() as *const T as *mut T, value);
         }

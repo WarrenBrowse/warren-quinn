@@ -9,8 +9,7 @@ use qlog::streamer::QlogStreamer;
 use crate::QlogStream;
 use crate::{
     Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, MIN_INITIAL_SIZE, VarInt, VarIntBoundsExceeded,
-    congestion,
-    connection::qlog::QlogSink,
+    congestion, connection::qlog::QlogSink,
 };
 
 /// Parameters governing the core QUIC state machine

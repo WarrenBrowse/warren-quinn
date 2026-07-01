@@ -3285,15 +3285,14 @@ impl Connection {
             // Initial spaces; each opts in via its own `TransportConfig`.
             // `None` (the default) preserves upstream behaviour and
             // writes as much CRYPTO data as fits.
-            let initial_crypto_first_fragment_cap = if space_id == SpaceId::Initial
-                && frame.offset == 0
-            {
-                self.config
-                    .initial_crypto_first_fragment_size
-                    .map_or(usize::MAX, |n| n as usize)
-            } else {
-                usize::MAX
-            };
+            let initial_crypto_first_fragment_cap =
+                if space_id == SpaceId::Initial && frame.offset == 0 {
+                    self.config
+                        .initial_crypto_first_fragment_size
+                        .map_or(usize::MAX, |n| n as usize)
+                } else {
+                    usize::MAX
+                };
 
             let len = frame
                 .data
@@ -3307,8 +3306,8 @@ impl Connection {
             // finalize the current UDP datagram once the truncated
             // CRYPTO has been written, so the remaining handshake bytes
             // ship in a separate UDP datagram on the next cycle.
-            let split_due_to_first_fragment_cap =
-                initial_crypto_first_fragment_cap != usize::MAX && len >= initial_crypto_first_fragment_cap;
+            let split_due_to_first_fragment_cap = initial_crypto_first_fragment_cap != usize::MAX
+                && len >= initial_crypto_first_fragment_cap;
 
             let data = frame.data.split_to(len);
             let truncated = frame::Crypto {

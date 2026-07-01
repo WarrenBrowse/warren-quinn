@@ -678,8 +678,9 @@ fn send_chunks(
         hdrs[i].msg_datalen = chunk.len();
         cnt += 1;
     }
-    let sent =
-        retry_if_interrupted(|| unsafe { sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0) })?;
+    let sent = retry_if_interrupted(|| unsafe {
+        sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0)
+    })?;
     Ok(sent as usize)
 }
 
