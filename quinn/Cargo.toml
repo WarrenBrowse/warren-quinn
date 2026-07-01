@@ -1,6 +1,6 @@
 [package]
 name = "warren-quinn"
-version = "0.11.10"
+version = "0.11.11"
 license.workspace = true
 repository.workspace = true
 description = "Versatile QUIC transport protocol implementation"
@@ -62,7 +62,7 @@ bytes = { workspace = true }
 futures-io = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 pin-project-lite = { workspace = true }
-proto = { package = "warren-quinn-proto", path = "../quinn-proto", version = "0.11.15-fork.5", default-features = false }
+proto = { package = "warren-quinn-proto", path = "../quinn-proto", version = "0.11.15-fork.6", default-features = false }
 rustls = { workspace = true, optional = true }
 smol = { workspace = true, optional = true }
 thiserror = { workspace = true }

@@ -1,6 +1,6 @@
 # warren-quinn
 
-A thin fork of [quinn](https://github.com/quinn-rs/quinn) (0.11.x base,
+A thin fork of [quinn](https://github.com/quinn-rs/quinn) (quinn 0.11.11,
 quinn-proto 0.11.15, quinn-udp 0.6.1) carrying a small set of transport
 deltas, published as renamed crates so downstreams inherit them transitively
 (no `[patch.crates-io]` required):
@@ -13,7 +13,7 @@ The lib names are unchanged, so consumers depend with a package rename and keep
 `use quinn` untouched:
 
 ```toml
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-fork.5", package = "warren-quinn" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-fork.6", package = "warren-quinn" }
 ```
 
 ## Deltas vs upstream
@@ -34,5 +34,11 @@ quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-
    yields `TooManyChunks` past 1024 buffered chunks, mapped to a connection
    `INTERNAL_ERROR`, so a peer sending maliciously gapped frames can no longer
    exhaust receiver memory.
+6. **Timer correctness backport** (quinn -> 0.11.11): upstream PR `c1e903bc`
+   detects deadline expiry via `runtime.now()` instead of polling the async
+   timer, so a PTO / loss-detection / idle deadline is honoured even when
+   Tokio's cooperative budget is exhausted while draining a busy conn-event
+   channel. Matters here because the GSO sizing above amplifies exactly that
+   busy-channel case.
 
 Licensed `MIT OR Apache-2.0`, same as upstream quinn.
