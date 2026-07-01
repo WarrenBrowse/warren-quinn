@@ -1,7 +1,7 @@
 # warren-quinn
 
 A thin fork of [quinn](https://github.com/quinn-rs/quinn) (0.11.x base,
-quinn-proto 0.11.14, quinn-udp 0.6.1) carrying a small set of transport
+quinn-proto 0.11.15, quinn-udp 0.6.1) carrying a small set of transport
 deltas, published as renamed crates so downstreams inherit them transitively
 (no `[patch.crates-io]` required):
 
@@ -13,7 +13,7 @@ The lib names are unchanged, so consumers depend with a package rename and keep
 `use quinn` untouched:
 
 ```toml
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.14-fork.4", package = "warren-quinn" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-fork.5", package = "warren-quinn" }
 ```
 
 ## Deltas vs upstream
@@ -29,5 +29,10 @@ quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.14-
    only handles on unix).
 4. **Apple fast datapath** (quinn-udp): upstream PR #2672 partial-send tail
    buffering, ported with buffering enabled, auto-enabled when symbols resolve.
+5. **Security backport** (quinn-proto -> 0.11.15): upstream PR #2694
+   (RUSTSEC-2026-0185) bounds out-of-order stream reassembly. `Assembler::insert`
+   yields `TooManyChunks` past 1024 buffered chunks, mapped to a connection
+   `INTERNAL_ERROR`, so a peer sending maliciously gapped frames can no longer
+   exhaust receiver memory.
 
 Licensed `MIT OR Apache-2.0`, same as upstream quinn.
