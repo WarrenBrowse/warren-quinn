@@ -241,12 +241,17 @@ impl TransportConfig {
     ///
     /// Replaces the RFC 9000 floor (`MIN_INITIAL_SIZE` = 1200) at the
     /// `pad_to(...)` sites of the transmit loop. The default `1200`
-    /// reproduces upstream behaviour. Setting it above the configured
-    /// [`TransportConfig::initial_mtu`] makes a padded handshake
-    /// coalesce over two or more UDP datagrams, which is useful for
-    /// anti-ossification and first-flight size uniformity. Values below
-    /// `1200` are clamped to `1200` (RFC 9000 requires every
-    /// Initial-carrying UDP datagram be at least 1200 bytes).
+    /// reproduces upstream behaviour. Raising it (up to the path MTU)
+    /// is useful for anti-ossification and first-flight size
+    /// uniformity. Values below `1200` are clamped to `1200` (RFC 9000
+    /// requires every Initial-carrying UDP datagram be at least 1200
+    /// bytes). Values above the current path MTU (the configured
+    /// [`TransportConfig::initial_mtu`] during the handshake) are
+    /// clamped to that MTU at the padding site: padding past the MTU
+    /// would emit a UDP datagram the network cannot deliver and stall
+    /// the handshake, so an over-MTU floor degrades to pad-to-MTU
+    /// instead. To spread the handshake over several datagrams, use
+    /// [`TransportConfig::initial_crypto_first_fragment_size`].
     pub fn initial_datagram_min_size(&mut self, value: u16) -> &mut Self {
         self.initial_datagram_min_size = value.max(MIN_INITIAL_SIZE);
         self

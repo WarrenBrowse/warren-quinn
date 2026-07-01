@@ -3439,7 +3439,8 @@ fn initial_datagram_min_size_default_matches_upstream() {
 
 /// Fork knob `initial_datagram_min_size` raised above the RFC floor but
 /// below the path MTU: the first client datagram honors the higher padding
-/// floor and the handshake still completes.
+/// floor and the handshake still completes. The floor is clamped to the
+/// path MTU during the handshake, so `initial_mtu` must be raised with it.
 #[test]
 fn initial_datagram_min_size_raises_padding_floor() {
     let _guard = subscribe();
@@ -3447,6 +3448,7 @@ fn initial_datagram_min_size_raises_padding_floor() {
     let mut client_config = client_config();
     Arc::get_mut(&mut client_config.transport)
         .unwrap()
+        .initial_mtu(DEFAULT_MTU as u16)
         .initial_datagram_min_size(RAISED_FLOOR);
 
     let mut pair = Pair::default();
@@ -3543,4 +3545,45 @@ fn initial_crypto_first_fragment_splits_client_hello() {
     );
     // The split produced at least two CRYPTO frames in the Initial space.
     assert!(pair.client_conn_mut(client_ch).stats().frame_tx.crypto >= 2);
+}
+
+/// Fork knob `initial_datagram_min_size` set above the path MTU: the
+/// padding floor is clamped to the MTU at the pad site, so the first
+/// flight stays deliverable and the handshake completes instead of
+/// stalling on an oversized datagram.
+#[test]
+fn initial_datagram_min_size_above_mtu_clamps_to_path_mtu() {
+    let _guard = subscribe();
+    let mut client_config = client_config();
+    Arc::get_mut(&mut client_config.transport)
+        .unwrap()
+        .initial_datagram_min_size(3000);
+
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config);
+    pair.client.drive(pair.time, pair.server.addr);
+
+    assert_eq!(pair.client.outbound.len(), 1);
+    // Clamped to the initial path MTU, not padded to the configured 3000
+    // (which the pair harness, like a real network, would drop).
+    assert_eq!(pair.client.outbound[0].1.len(), usize::from(INITIAL_MTU));
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
 }

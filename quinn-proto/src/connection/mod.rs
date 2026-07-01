@@ -635,8 +635,15 @@ impl Connection {
                     if pad_datagram {
                         // Configurable floor instead of the hard-coded RFC
                         // 9000 `MIN_INITIAL_SIZE`. Default reproduces
-                        // upstream behaviour (1200).
-                        builder.pad_to(self.config.initial_datagram_min_size);
+                        // upstream behaviour (1200). Clamped to the path MTU:
+                        // `pad_to` has no capacity cap, so a floor above the
+                        // MTU emits an oversized datagram the network drops,
+                        // stalling the handshake.
+                        builder.pad_to(
+                            self.config
+                                .initial_datagram_min_size
+                                .min(self.path.current_mtu()),
+                        );
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -927,8 +934,13 @@ impl Connection {
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
                 // Same configurable floor as the main packet-finish
-                // branch above. Default 1200 = upstream behaviour.
-                builder.pad_to(self.config.initial_datagram_min_size);
+                // branch above, with the same path-MTU clamp. Default
+                // 1200 = upstream behaviour.
+                builder.pad_to(
+                    self.config
+                        .initial_datagram_min_size
+                        .min(self.path.current_mtu()),
+                );
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
