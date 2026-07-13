@@ -57,6 +57,8 @@ wasm-bindgen-test = { version = "0.3.45" }
 web-time = "1"
 windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
 cfg_aliases = "0.2"
+# quinn-udp PR #2672 port: partial-send tail buffer mutex.
+parking_lot = "0.12.5"
 
 # quinn-udp 0.6.1 (overlaid from the upstream main lineage onto this 0.11.x
 # base) opts into `[lints] workspace = true`, so the 0.11.x workspace root
