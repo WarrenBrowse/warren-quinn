@@ -3398,3 +3398,233 @@ fn preferred_address() {
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
     pair.connect();
 }
+
+/// Fork knob `initial_datagram_min_size` left at its default: the first
+/// client flight must be indistinguishable from upstream, a single UDP
+/// datagram padded to exactly the RFC 9000 floor (1200 bytes). Also covers
+/// the `initial_crypto_first_fragment_size = None` default: the whole
+/// ClientHello fits in that one datagram and the handshake completes.
+#[test]
+fn initial_datagram_min_size_default_matches_upstream() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config());
+    pair.client.drive(pair.time, pair.server.addr);
+
+    assert_eq!(pair.client.outbound.len(), 1);
+    assert_eq!(
+        pair.client.outbound[0].1.len(),
+        usize::from(MIN_INITIAL_SIZE)
+    );
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+}
+
+/// Fork knob `initial_datagram_min_size` raised above the RFC floor but
+/// below the path MTU: the first client datagram honors the higher padding
+/// floor and the handshake still completes. The floor is clamped to the
+/// path MTU during the handshake, so `initial_mtu` must be raised with it.
+#[test]
+fn initial_datagram_min_size_raises_padding_floor() {
+    let _guard = subscribe();
+    const RAISED_FLOOR: u16 = 1400;
+    let mut client_config = client_config();
+    Arc::get_mut(&mut client_config.transport)
+        .unwrap()
+        .initial_mtu(DEFAULT_MTU as u16)
+        .initial_datagram_min_size(RAISED_FLOOR);
+
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config);
+    pair.client.drive(pair.time, pair.server.addr);
+
+    assert_eq!(pair.client.outbound.len(), 1);
+    assert!(pair.client.outbound[0].1.len() >= usize::from(RAISED_FLOOR));
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+}
+
+/// Fork knob `initial_datagram_min_size` set below the RFC 9000 floor: the
+/// setter clamps up to 1200, so the wire keeps every Initial-carrying
+/// datagram spec-compliant.
+#[test]
+fn initial_datagram_min_size_clamps_below_rfc_floor() {
+    let _guard = subscribe();
+    let mut client_config = client_config();
+    Arc::get_mut(&mut client_config.transport)
+        .unwrap()
+        .initial_datagram_min_size(600);
+
+    let mut pair = Pair::default();
+    pair.begin_connect(client_config);
+    pair.client.drive(pair.time, pair.server.addr);
+
+    assert_eq!(pair.client.outbound.len(), 1);
+    assert_eq!(
+        pair.client.outbound[0].1.len(),
+        usize::from(MIN_INITIAL_SIZE)
+    );
+
+    pair.drive();
+    pair.server.assert_accept();
+}
+
+/// Fork knob `initial_crypto_first_fragment_size`: a cap smaller than the
+/// ClientHello splits the first CRYPTO frame, so the first client flight
+/// spans two UDP datagrams (each still padded to the RFC floor) and the
+/// handshake completes across them.
+#[test]
+fn initial_crypto_first_fragment_splits_client_hello() {
+    let _guard = subscribe();
+    const FIRST_FRAGMENT_CAP: u16 = 100;
+    let mut client_config = client_config();
+    Arc::get_mut(&mut client_config.transport)
+        .unwrap()
+        .initial_crypto_first_fragment_size(Some(FIRST_FRAGMENT_CAP));
+
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config);
+    pair.client.drive(pair.time, pair.server.addr);
+
+    assert_eq!(pair.client.outbound.len(), 2);
+    for (_, datagram) in &pair.client.outbound {
+        assert!(datagram.len() >= usize::from(MIN_INITIAL_SIZE));
+    }
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    // The split produced at least two CRYPTO frames in the Initial space.
+    assert!(pair.client_conn_mut(client_ch).stats().frame_tx.crypto >= 2);
+}
+
+/// Fork knob `initial_crypto_first_fragment_size` set to `Some(0)`: the
+/// setter clamps to `Some(1)` (a zero cap would never advance the CRYPTO
+/// offset and would stall the handshake in an endless empty-CRYPTO datagram
+/// loop). The first flight still spans two datagrams and the handshake
+/// completes.
+#[test]
+fn initial_crypto_first_fragment_zero_is_clamped() {
+    let _guard = subscribe();
+    let mut client_config = client_config();
+    Arc::get_mut(&mut client_config.transport)
+        .unwrap()
+        .initial_crypto_first_fragment_size(Some(0));
+
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config);
+    pair.client.drive(pair.time, pair.server.addr);
+
+    // Clamped to a 1-byte first fragment: exactly two Initial datagrams,
+    // not an unbounded stream of empty-CRYPTO ones.
+    assert_eq!(pair.client.outbound.len(), 2);
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+}
+
+/// Fork knob `initial_datagram_min_size` set above the path MTU: the
+/// padding floor is clamped to the MTU at the pad site, so the first
+/// flight stays deliverable and the handshake completes instead of
+/// stalling on an oversized datagram.
+#[test]
+fn initial_datagram_min_size_above_mtu_clamps_to_path_mtu() {
+    let _guard = subscribe();
+    let mut client_config = client_config();
+    Arc::get_mut(&mut client_config.transport)
+        .unwrap()
+        .initial_datagram_min_size(3000);
+
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config);
+    pair.client.drive(pair.time, pair.server.addr);
+
+    assert_eq!(pair.client.outbound.len(), 1);
+    // Clamped to the initial path MTU, not padded to the configured 3000
+    // (which the pair harness, like a real network, would drop).
+    assert_eq!(pair.client.outbound[0].1.len(), usize::from(INITIAL_MTU));
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+}

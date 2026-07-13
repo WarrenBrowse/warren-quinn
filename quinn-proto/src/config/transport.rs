@@ -8,8 +8,8 @@ use qlog::streamer::QlogStreamer;
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
+    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, MIN_INITIAL_SIZE, VarInt, VarIntBoundsExceeded,
+    congestion, connection::qlog::QlogSink,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -40,6 +40,12 @@ pub struct TransportConfig {
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
+    // Lower bound consumed by the `pad_to(...)` sites in the handshake
+    // transmit loop. Default is the RFC 9000 floor (1200).
+    pub(crate) initial_datagram_min_size: u16,
+    // Cap on the CRYPTO bytes written into the first Initial packet.
+    // `None` keeps upstream behaviour (no artificial fragmentation).
+    pub(crate) initial_crypto_first_fragment_size: Option<u16>,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -230,6 +236,49 @@ impl TransportConfig {
         self
     }
 
+    /// Minimum UDP payload size targeted when padding the handshake
+    /// `Initial` datagram(s).
+    ///
+    /// Replaces the RFC 9000 floor (`MIN_INITIAL_SIZE` = 1200) at the
+    /// `pad_to(...)` sites of the transmit loop. The default `1200`
+    /// reproduces upstream behaviour. Raising it (up to the path MTU)
+    /// is useful for anti-ossification and first-flight size
+    /// uniformity. Values below `1200` are clamped to `1200` (RFC 9000
+    /// requires every Initial-carrying UDP datagram be at least 1200
+    /// bytes). Values above the current path MTU (the configured
+    /// [`TransportConfig::initial_mtu`] during the handshake) are
+    /// clamped to that MTU at the padding site: padding past the MTU
+    /// would emit a UDP datagram the network cannot deliver and stall
+    /// the handshake, so an over-MTU floor degrades to pad-to-MTU
+    /// instead. To spread the handshake over several datagrams, use
+    /// [`TransportConfig::initial_crypto_first_fragment_size`].
+    pub fn initial_datagram_min_size(&mut self, value: u16) -> &mut Self {
+        self.initial_datagram_min_size = value.max(MIN_INITIAL_SIZE);
+        self
+    }
+
+    /// Maximum number of CRYPTO bytes placed in the first `Initial`
+    /// packet.
+    ///
+    /// `None` (the default) preserves upstream behaviour: the CRYPTO
+    /// writer packs as much handshake data as fits. `Some(n)` truncates
+    /// the first CRYPTO frame to at most `n` bytes; the remaining
+    /// handshake bytes are deferred to a following `Initial` packet,
+    /// which is emitted in a second UDP datagram once the first is
+    /// padded near the path MTU. The result is a first handshake flight
+    /// spanning two or more UDP datagrams, fragmenting the cleartext
+    /// ClientHello across datagrams (anti-ossification). CRYPTO frames
+    /// may be fragmented and are reassembled by offset (RFC 9000
+    /// section 7.5), so this stays spec-compliant and wire-compatible.
+    /// `Some(0)` is clamped to `Some(1)`: a zero-byte cap would never
+    /// advance the CRYPTO offset, so the handshake could not make
+    /// progress and the transmit loop would emit padded empty-CRYPTO
+    /// datagrams forever.
+    pub fn initial_crypto_first_fragment_size(&mut self, value: Option<u16>) -> &mut Self {
+        self.initial_crypto_first_fragment_size = value.map(|v| v.max(1));
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -375,6 +424,10 @@ impl Default for TransportConfig {
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
+            // Default = RFC 9000 floor, identical to upstream.
+            initial_datagram_min_size: MIN_INITIAL_SIZE,
+            // Default = no artificial CRYPTO fragmentation.
+            initial_crypto_first_fragment_size: None,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -412,6 +465,8 @@ impl fmt::Debug for TransportConfig {
             min_mtu,
             mtu_discovery_config,
             pad_to_mtu,
+            initial_datagram_min_size,
+            initial_crypto_first_fragment_size,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -441,6 +496,11 @@ impl fmt::Debug for TransportConfig {
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
+            .field("initial_datagram_min_size", initial_datagram_min_size)
+            .field(
+                "initial_crypto_first_fragment_size",
+                initial_crypto_first_fragment_size,
+            )
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",
