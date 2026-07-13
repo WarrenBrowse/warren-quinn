@@ -1,6 +1,8 @@
 [package]
-name = "quinn-udp"
-version = "0.6.1"
+name = "warren-quinn-udp"
+# Same repo-wide `-fork.<N>` level as the sibling crates. Base: upstream
+# quinn-udp 0.6.1 (tag `quinn-udp-0.6.1`, main lineage).
+version = "0.6.1-fork.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -39,6 +41,7 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net"] }
 cfg_aliases = { workspace = true }
 
 [lib]
+name = "quinn_udp"
 # See https://github.com/bheisler/criterion.rs/blob/master/book/src/faq.md#cargo-bench-gives-unrecognized-option-errors-for-valid-command-line-options
 bench = false
 
