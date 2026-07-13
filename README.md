@@ -13,16 +13,20 @@ The lib names are unchanged, so consumers depend with a package rename and keep
 `use quinn` untouched:
 
 ```toml
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-fork.6", package = "warren-quinn" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.16-fork.8", package = "warren-quinn" }
 ```
 
-The next tag will be `v0.11.16-fork.8`; it is cut only after a Hetzner
-real-exit bench validates the CUBIC fast-convergence behavior change folded
-from upstream 0.11.15 and the 0.11.16 dependency updates (rand 0.10, PCG BBR
-RNG, fastbloom 0.17, rustls-platform-verifier 0.7). Until then consumers keep
-pinning `v0.11.15-fork.6`. The fork level `N` in `-fork.<N>` is repo-wide: all
-three crates bump it in lockstep (quinn `0.11.11-fork.8`, quinn-proto
-`0.11.16-fork.8`, quinn-udp `0.6.1-fork.8`).
+The fork level `N` in `-fork.<N>` is repo-wide: all three crates bump it in
+lockstep (quinn `0.11.11-fork.8`, quinn-proto `0.11.16-fork.8`, quinn-udp
+`0.6.1-fork.8`).
+
+`v0.11.16-fork.8` was cut only after a Hetzner A/B bench cleared the behaviour
+changes folded in from upstream 0.11.15/0.11.16 — chiefly the **BBR RNG switch
+to PCG**, which lands in the default congestion controller, and the CUBIC
+fast-convergence fix. Tunnel TCP came back flat within ±0.5% against the
+`fork.6` baseline on the same hardware (report:
+`warren-core/bench/results/2026-07-13_QUINN-FORK8_ab-hetzner.md`). A tag is
+never cut on this repo without that bench.
 
 ## Upstream base (true git ancestry)
 
