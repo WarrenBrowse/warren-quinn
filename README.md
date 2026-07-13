@@ -1,127 +1,109 @@
-<h1 align="center"><img width="500" src="https://raw.githubusercontent.com/quinn-rs/quinn/51a3cea225670757cb844a342428e4e1341d9f13/docs/thumbnail.svg" /></h1>
+# warren-quinn
 
-[![Documentation](https://docs.rs/quinn/badge.svg)](https://docs.rs/quinn/)
-[![Crates.io](https://img.shields.io/crates/v/quinn.svg)](https://crates.io/crates/quinn)
-[![Build status](https://github.com/quinn-rs/quinn/workflows/CI/badge.svg)](https://github.com/djc/quinn/actions?query=workflow%3ACI)
-[![codecov](https://codecov.io/gh/quinn-rs/quinn/branch/main/graph/badge.svg)](https://codecov.io/gh/quinn-rs/quinn)
-[![Chat](https://img.shields.io/badge/chat-%23quinn:matrix.org-%2346BC99?logo=matrix)](https://matrix.to/#/#quinn:matrix.org)
-[![Chat](https://img.shields.io/discord/976380008299917365?logo=discord)](https://discord.gg/SGPEcDfVzh)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE-MIT)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
+A thin fork of [quinn](https://github.com/quinn-rs/quinn) (quinn 0.11.11,
+quinn-proto 0.11.16, quinn-udp 0.6.1) carrying a small set of transport
+deltas, published as renamed crates so downstreams inherit them transitively
+(no `[patch.crates-io]` required):
 
-Quinn is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol.
-The project was founded by [Dirkjan Ochtman](https://github.com/djc) and
-[Benjamin Saunders](https://github.com/Ralith) as a side project in 2018, and has seen more than
-30 releases since then. If you're using Quinn in a commercial setting, please consider
-[sponsoring](https://opencollective.com/quinn-rs) the project.
+- `warren-quinn` (lib `quinn`)
+- `warren-quinn-proto` (lib `quinn_proto`)
+- `warren-quinn-udp` (lib `quinn_udp`)
 
-## Features
+The lib names are unchanged, so consumers depend with a package rename and keep
+`use quinn` untouched:
 
-- Simultaneous client/server operation
-- Ordered and unordered stream reads for improved performance
-- Works on stable Rust, tested on Linux, macOS and Windows
-- Pluggable cryptography, with a standard implementation backed by
-  [rustls][rustls] and [*ring*][ring]
-- Application-layer datagrams for small, unreliable messages
-- Future-based async API
-- Minimum supported Rust version of 1.74.1
-
-## Overview
-
-- **quinn:** High-level async API based on tokio, see [examples][examples] for usage. This will be used by most developers. (Basic benchmarks are included.)
-- **quinn-proto:** Deterministic state machine of the protocol which performs [**no** I/O][sans-io] internally and is suitable for use with custom event loops (and potentially a C or C++ API).
-- **quinn-udp:** UDP sockets with ECN information tuned for the protocol.
-- **bench:** Benchmarks without any framework.
-- **fuzz:** Fuzz tests.
-
-# Getting Started
-
-**Examples**
-
-```sh
-$ cargo run --example server ./
-$ cargo run --example client https://localhost:4433/Cargo.toml
+```toml
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.15-fork.6", package = "warren-quinn" }
 ```
 
-This launches an HTTP 0.9 server on the loopback address serving the current
-working directory, with the client fetching `./Cargo.toml`. By default, the
-server generates a self-signed certificate and stores it to disk, where the
-client will automatically find and trust it.
+The next tag will be `v0.11.16-fork.8`; it is cut only after a Hetzner
+real-exit bench validates the CUBIC fast-convergence behavior change folded
+from upstream 0.11.15 and the 0.11.16 dependency updates (rand 0.10, PCG BBR
+RNG, fastbloom 0.17, rustls-platform-verifier 0.7). Until then consumers keep
+pinning `v0.11.15-fork.6`. The fork level `N` in `-fork.<N>` is repo-wide: all
+three crates bump it in lockstep (quinn `0.11.11-fork.8`, quinn-proto
+`0.11.16-fork.8`, quinn-udp `0.6.1-fork.8`).
 
-**Links**
+## Upstream base (true git ancestry)
 
-- Talk at [RustFest Paris (May 2018) presentation][talk]; [slides][slides]; [YouTube][youtube]
-- Usage [examples][examples]
-- Guide [book][documentation]
+`main` sits directly on upstream git history: upstream branch `0.11.x` at
+commit `a96949f6` — the released `quinn-proto-0.11.16` state, which also
+contains quinn 0.11.11 (tag `quinn-0.11.11`) — followed by one fork commit per
+concern. `git log upstream/0.11.x..main` therefore lists exactly the fork
+surface, and moving to a newer upstream 0.11.x state is a plain `git rebase`
+(or merge) instead of a tree reconstruction.
 
-## Usage Notes
+One deliberate mix: `quinn-udp` is not the 0.5.15 of branch 0.11.x but an
+overlay of tag `quinn-udp-0.6.1` (commit `38c036ad`, upstream **main**
+lineage), because the Apple fast-datapath work targets the udp 0.6 line. The
+overlay is its own commit and brings the `[workspace.lints]` table that udp
+0.6.1 expects into the 0.11.x workspace root.
 
-<details>
-<summary>
-Click to show the notes
-</summary>
+History note: up to the `v0.11.15-fork.*` tags the repo was an orphan tree
+with no upstream ancestry. That history stays reachable through the released
+tags (and the `archive/orphan-history-fork.7` branch), so consumers pinning
+old tags are unaffected; only `main` was rebuilt.
 
-### Buffers
+## Deltas vs upstream
 
-A Quinn endpoint corresponds to a single UDP socket, no matter how many
-connections are in use. Handling high aggregate data rates on a single endpoint
-can require a larger UDP buffer than is configured by default in most
-environments. If you observe erratic latency and/or throughput over a stable
-network link, consider increasing the buffer sizes used. For example, you could
-adjust the `SO_SNDBUF` and `SO_RCVBUF` options of the UDP socket to be used
-before passing it in to Quinn. Note that some platforms (e.g. Linux) require
-elevated privileges or modified system configuration for a process to increase
-its UDP buffer sizes.
+1. **Initial-packet fragmentation control** (`TransportConfig::initial_datagram_min_size`,
+   `TransportConfig::initial_crypto_first_fragment_size`): pad the first Initial
+   datagram(s) to a configurable floor and cap the first CRYPTO fragment so the
+   handshake spans two or more UDP datagrams. Anti-ossification; defaults are
+   no-ops (RFC 9000 floor / no fragmentation). Spec-compliant (RFC 9000 sect 7.5).
+   The padding floor is clamped to the RFC 9000 minimum from below and to the
+   current path MTU from above (an over-MTU floor previously emitted an
+   undeliverable datagram and stalled the handshake; raise
+   `TransportConfig::initial_mtu` alongside the floor to go past 1200). A
+   `Some(0)` fragment cap is clamped to `Some(1)` (a zero cap can never advance
+   the CRYPTO offset and would stall the handshake in an endless empty-CRYPTO
+   datagram loop). Both knobs are covered in-fork by sans-io pair tests in
+   `quinn-proto/src/tests` (`initial_datagram_min_size_*`,
+   `initial_crypto_first_fragment_*`), including the defaults-match-upstream,
+   above-MTU-clamp and zero-cap-clamp cases.
+2. **GSO transmit sizing**: `MAX_TRANSMIT_DATAGRAMS` 20 -> 80,
+   `MAX_TRANSMIT_SEGMENTS` 10 -> 40, send-buffer pre-allocation.
+3. **Socket buffer sizing**: kernel send/recv buffers auto-sized at socket
+   creation on unix and windows (upstream only exposes manual setters).
+4. **Apple fast datapath** (quinn-udp): upstream PR #2672 partial-send tail
+   buffering, ported with buffering enabled, auto-enabled when the private
+   `sendmsg_x`/`recvmsg_x` symbols resolve. Includes release hardening beyond
+   the PR: an out-of-contract `Ok(0)` from `sendmsg_x` is treated as
+   backpressure (`WouldBlock`) instead of spinning on a zero-progress loop.
 
-### Certificates
+## Patch files (portable form of the deltas)
 
-By default, Quinn clients validate the cryptographic identity of servers they
-connect to. This prevents an active, on-path attacker from intercepting
-messages, but requires trusting some certificate authority. For many purposes,
-this can be accomplished by using certificates from [Let's Encrypt][letsencrypt]
-for servers, and relying on the default configuration for clients.
+Each fork delta is also committed as an isolated patch at the repo root,
+regenerated from the rebased history (each file is the exact diff of its fork
+commit). They are the fallback when upstream refactors force a manual port;
+the primary upgrade path is now a plain `git rebase`.
 
-For some cases, including peer-to-peer, trust-on-first-use, deliberately
-insecure applications, or any case where servers are not identified by domain
-name, this isn't practical. Arbitrary certificate validation logic can be
-implemented by enabling the `dangerous_configuration` feature of `rustls` and
-constructing a Quinn `ClientConfig` with an overridden certificate verifier by
-hand.
+- `upstream-initial-fragmentation.patch`: the two Initial-fragmentation knobs
+  plus their pair tests, the only delta proposed for upstream (see
+  `UPSTREAM-PR.md`). Applies clean on upstream `0.11.x` commit `a96949f6`;
+  a submission against upstream **main** needs a manual port (main has moved
+  to the 0.12 line).
+- `fork-gso.patch`: GSO transmit sizing in `quinn/src/connection.rs`
+  (fork-local). Applies on tag `quinn-0.11.11` content, unchanged through
+  `a96949f6`.
+- `fork-windows-sockbuf.patch`: kernel socket-buffer auto-sizing at socket
+  creation, `quinn-udp/src/windows.rs` plus the matching `unix.rs` hunk
+  (fork-local). Applies on tag `quinn-udp-0.6.1`.
+- `fork-apple-datapath.patch`: the PR #2672 port (partial `sendmsg_x` tail
+  buffering, auto-enable via `dlsym`, `Ok(0)` hardening) in
+  `quinn-udp/src/unix.rs`, its `parking_lot` feature wiring, and its tests
+  (fork-local). Applies on its parent fork commit (tag `quinn-udp-0.6.1` +
+  `fork-windows-sockbuf.patch`); its manifest hunks reference the fork's
+  renamed Cargo.toml files, so on a pristine upstream base apply the patches
+  in the order listed here and fix the manifest context by hand.
 
-When operating your own certificate authority doesn't make sense, [rcgen][rcgen]
-can be used to generate self-signed certificates on demand. To support
-trust-on-first-use, servers that automatically generate self-signed certificates
-should write their generated certificate to persistent storage and reuse it on
-future runs.
+The `fork-` prefix marks deltas that stay fork-local per `UPSTREAM-PR.md`;
+only the `upstream-` patch is intended for submission.
 
-</details>
-<p></p>
+**Moving to a new upstream 0.11.x state**: `git rebase` the fork commits onto
+the new upstream commit (or merge upstream in), re-run the proto and udp test
+suites (`cargo test -p warren-quinn-proto`, `cargo test -p warren-quinn-udp
+--features fast-apple-datapath` on a Mac), then regenerate every patch file
+(`git diff <commit>^ <commit> > <file>.patch`) so the next move starts clean.
 
-## Contribution
-
-All feedback welcome. Feel free to file bugs, requests for documentation and
-any other feedback to the [issue tracker][issues].
-
-The quinn-proto test suite uses simulated IO for reproducibility and to avoid
-long sleeps in certain timing-sensitive tests. If the `SSLKEYLOGFILE`
-environment variable is set, the tests will emit UDP packets for inspection
-using external protocol analyzers like Wireshark, and NSS-compatible key logs
-for the client side of each connection will be written to the path specified in
-the variable.
-
-The minimum supported Rust version for published releases of our
-crates will always be at least 6 months old at the time of release.
-
-[quic]: https://quicwg.github.io/
-[issues]: https://github.com/djc/quinn/issues
-[rustls]: https://github.com/ctz/rustls
-[ring]: https://github.com/briansmith/ring
-[talk]: https://paris.rustfest.eu/sessions/a-quic-future-in-rust
-[slides]: https://github.com/djc/talks/blob/ff760845b51ba4836cce82e7f2c640ecb5fd59fa/2018-05-26%20A%20QUIC%20future%20in%20Rust/Quinn-Speaker.pdf
-[animation]: https://dirkjan.ochtman.nl/files/head-of-line-blocking.html
-[youtube]: https://www.youtube.com/watch?v=EHgyY5DNdvI
-[letsencrypt]: https://letsencrypt.org/
-[rcgen]: https://crates.io/crates/rcgen
-[examples]: https://github.com/djc/quinn/tree/main/quinn/examples
-[documentation]: https://quinn-rs.github.io/quinn/networking-introduction.html
-[sans-io]: https://sans-io.readthedocs.io/how-to-sans-io.html
+Licensed `MIT OR Apache-2.0`, same as upstream quinn.
