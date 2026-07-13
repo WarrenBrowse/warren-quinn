@@ -62,6 +62,15 @@ pub struct UdpSocketState {
     /// Apple OS versions. Callers must verify availability before enabling.
     #[cfg(apple_fast)]
     apple_fast_path: AtomicBool,
+
+    /// Upstream PR #2672, ported with buffering enabled: the unsent
+    /// tail of a partially-completed `sendmsg_x` batch. `sendmsg_x` can accept
+    /// fewer datagrams than submitted when the send buffer fills mid-batch and
+    /// returns the accepted count; upstream 0.6.1 ignored that count and
+    /// silently dropped the tail. We carry it here and flush it before the next
+    /// send so a batch is delivered exactly once, in order, with no drops.
+    #[cfg(apple_fast)]
+    partial_transmit: parking_lot::Mutex<Option<PartialTransmit>>,
 }
 
 impl UdpSocketState {
@@ -75,16 +84,16 @@ impl UdpSocketState {
             || cfg!(solarish)
         {
             cmsg_platform_space +=
-                unsafe { libc::CMSG_SPACE(mem::size_of::<libc::in6_pktinfo>() as _) as usize };
+                unsafe { libc::CMSG_SPACE(size_of::<libc::in6_pktinfo>() as _) as usize };
         }
 
         assert!(
             CMSG_LEN
-                >= unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as _) as usize }
+                >= unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as _) as usize }
                     + cmsg_platform_space
         );
         assert!(
-            mem::align_of::<libc::cmsghdr>() <= mem::align_of::<cmsg::Aligned<[u8; 0]>>(),
+            align_of::<libc::cmsghdr>() <= align_of::<cmsg::Aligned<[u8; 0]>>(),
             "control message buffers will be misaligned"
         );
 
@@ -207,7 +216,7 @@ impl UdpSocketState {
         }
 
         let now = Instant::now();
-        Ok(Self {
+        let this = Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
             max_gso_segments: AtomicUsize::new(gso::max_gso_segments(&*io)),
             gro_segments,
@@ -215,7 +224,25 @@ impl UdpSocketState {
             sendmsg_einval: AtomicBool::new(false),
             #[cfg(apple_fast)]
             apple_fast_path: AtomicBool::new(false),
-        })
+            #[cfg(apple_fast)]
+            partial_transmit: parking_lot::Mutex::new(None),
+        };
+
+        // enable the Apple fast datapath automatically at socket
+        // creation, but only if the private `sendmsg_x`/`recvmsg_x` symbols
+        // actually resolve at runtime. The `fast-apple-datapath` cargo feature
+        // is the opt-in (gated to macOS desktop builds, never iOS: private API,
+        // App Store guideline 2.5.1); resolving the symbols here means we never
+        // bump `max_gso_segments` to a batched value on an OS that lacks them
+        // (which would otherwise have the slow-path fallback emit one oversized
+        // datagram for the first batch).
+        #[cfg(apple_fast)]
+        if sendmsg_x_fn().is_some() && recvmsg_x_fn().is_some() {
+            // SAFETY: the symbols resolved above, so the private APIs are present.
+            unsafe { this.set_apple_fast_path() };
+        }
+
+        Ok(this)
     }
 
     /// Sends a [`Transmit`] on the given socket.
@@ -395,6 +422,13 @@ impl UdpSocketState {
         }
         f
     }
+
+    /// Upstream PR #2672: the queue holding the unsent tail of a
+    /// partially-completed `sendmsg_x` batch, flushed before the next send.
+    #[cfg(apple_fast)]
+    fn partial_transmit(&self) -> parking_lot::MutexGuard<'_, Option<PartialTransmit>> {
+        self.partial_transmit.lock()
+    }
 }
 
 #[cfg(not(any(apple, target_os = "openbsd", target_os = "netbsd")))]
@@ -492,48 +526,199 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
 }
 
 /// Send using the fast `sendmsg_x` API.
+///
+/// ported from upstream PR #2672 ("buffer unsent tail of partial
+/// `sendmsg_x` calls"), WITH the tail-buffering enabled. `sendmsg_x` submits a
+/// batch of independent datagrams in one syscall and returns how many it
+/// accepted; when the send buffer fills mid-batch it accepts fewer than
+/// submitted. Upstream 0.6.1 discarded that count and silently dropped the
+/// remainder (the bug @jamilbk found while debugging throughput). Here we:
+///   1. flush any tail buffered from a previous partial send first,
+///   2. advance through the current batch by the accepted count, retrying the
+///      unsent portion in-loop while progress is made,
+///   3. on `WouldBlock` after partial progress, buffer the remainder and
+///      return `Ok(())` so the caller hands us the next `Transmit`, at which
+///      point we drain the buffer first.
+///
+/// This guarantees every datagram is delivered exactly once and in order.
+///
+/// NOTE: the upstream draft left step 3's buffering commented out (pending a
+/// maintainer decision on memcpy churn for bulk transfer). We enable it: a
+/// bounded per-event `Vec` copy is strictly cheaper than dropping datagrams and
+/// forcing QUIC-layer retransmits, and dropping would violate our no-silent-loss
+/// requirement. The flush in step 1 suspends on `WouldBlock`, so this cannot
+/// busy-spin.
 #[cfg(apple_fast)]
 fn send_via_sendmsg_x(
     state: &UdpSocketState,
     io: SockRef<'_>,
     transmit: &Transmit<'_>,
 ) -> io::Result<()> {
+    let Some(sendmsg_x) = state.resolve_apple_fast_fn(sendmsg_x_fn) else {
+        return send_single(state, io, transmit);
+    };
+
+    // Step 1: flush the tail buffered by a previous partial send, if any.
+    {
+        let mut pending = state.partial_transmit();
+        if let Some(p) = pending.as_mut() {
+            while !p.buf.is_empty() {
+                match send_chunks(
+                    &io,
+                    sendmsg_x,
+                    p.destination,
+                    p.ecn,
+                    p.src_ip,
+                    state.sendmsg_einval(),
+                    p.segment_size,
+                    &p.buf,
+                ) {
+                    // `Ok(0)` is out of contract for `sendmsg_x` (no error,
+                    // no progress); treat it as backpressure rather than
+                    // spinning on a zero-progress loop.
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                    Ok(sent) => {
+                        let n = (sent * p.segment_size).min(p.buf.len());
+                        p.buf.drain(..n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
+                    Err(_e) => {
+                        crate::log::debug!("dropping queued datagram after sendmsg_x error: {_e}");
+                        let n = p.segment_size.min(p.buf.len());
+                        p.buf.drain(..n);
+                    }
+                }
+            }
+        }
+        *pending = None;
+    }
+
+    // Step 2/3: send the current batch, advancing by the accepted count.
+    let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
+    let total = transmit.contents.len().div_ceil(segment_size);
+    let mut sent_datagrams = 0;
+
+    while sent_datagrams < total {
+        let remaining = &transmit.contents[sent_datagrams * segment_size..];
+        match send_chunks(
+            &io,
+            sendmsg_x,
+            transmit.destination,
+            transmit.ecn,
+            transmit.src_ip,
+            state.sendmsg_einval(),
+            segment_size,
+            remaining,
+        ) {
+            // Sent some datagrams; continue with the rest. (`Ok(0)` is out
+            // of contract for `sendmsg_x`; the guard keeps a zero-progress
+            // result from looping forever and routes it to the
+            // backpressure arms below.)
+            Ok(sent) if sent > 0 => sent_datagrams += sent,
+            Ok(_) if sent_datagrams == 0 => {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            Ok(_) => {
+                let remainder = &transmit.contents[sent_datagrams * segment_size..];
+                crate::log::debug!(
+                    "sendmsg_x accepted 0 of the remaining {} bytes; queuing for retry",
+                    remainder.len()
+                );
+                *state.partial_transmit() = Some(PartialTransmit {
+                    destination: transmit.destination,
+                    ecn: transmit.ecn,
+                    src_ip: transmit.src_ip,
+                    segment_size,
+                    buf: remainder.to_vec(),
+                });
+                return Ok(());
+            }
+            // Could not send any datagram yet: surface backpressure unchanged.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && sent_datagrams == 0 => {
+                return Err(e);
+            }
+            // Sent some, then blocked: buffer the remainder and report success.
+            // The next call drains it (step 1) before its own batch.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remainder = &transmit.contents[sent_datagrams * segment_size..];
+                crate::log::debug!(
+                    "sendmsg_x sent {sent_datagrams}/{total} datagrams; \
+                     queuing remaining {} bytes for retry",
+                    remainder.len()
+                );
+                *state.partial_transmit() = Some(PartialTransmit {
+                    destination: transmit.destination,
+                    ecn: transmit.ecn,
+                    src_ip: transmit.src_ip,
+                    segment_size,
+                    buf: remainder.to_vec(),
+                });
+                return Ok(());
+            }
+            // Any other error: surface without buffering.
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Splits `contents` into `segment_size`-sized datagrams and submits them with a
+/// single `sendmsg_x` call, returning the number of datagrams the kernel
+/// accepted. Extracted from `send_via_sendmsg_x` per upstream PR #2672.
+#[cfg(apple_fast)]
+#[allow(clippy::too_many_arguments)]
+fn send_chunks(
+    io: &SockRef<'_>,
+    sendmsg_x: SendmsgXFn,
+    destination: SocketAddr,
+    ecn: Option<EcnCodepoint>,
+    src_ip: Option<IpAddr>,
+    sendmsg_einval: bool,
+    segment_size: usize,
+    contents: &[u8],
+) -> io::Result<usize> {
     let mut hdrs = unsafe { mem::zeroed::<[msghdr_x; BATCH_SIZE]>() };
     let mut iovs = unsafe { mem::zeroed::<[libc::iovec; BATCH_SIZE]>() };
     let mut ctrls = [cmsg::Aligned([0u8; CMSG_LEN]); BATCH_SIZE];
-    let addr = socket2::SockAddr::from(transmit.destination);
-    let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
+    let addr = socket2::SockAddr::from(destination);
     let mut cnt = 0;
-    debug_assert!(transmit.contents.len().div_ceil(segment_size) <= BATCH_SIZE);
-    for (i, chunk) in transmit
-        .contents
-        .chunks(segment_size)
-        .enumerate()
-        .take(BATCH_SIZE)
-    {
+    debug_assert!(contents.len().div_ceil(segment_size) <= BATCH_SIZE);
+    for (i, chunk) in contents.chunks(segment_size).enumerate().take(BATCH_SIZE) {
         prepare_msg_x(
             &Transmit {
-                destination: transmit.destination,
-                ecn: transmit.ecn,
+                destination,
+                ecn,
                 contents: chunk,
                 segment_size: Some(chunk.len()),
-                src_ip: transmit.src_ip,
+                src_ip,
             },
             &addr,
             &mut hdrs[i],
             &mut iovs[i],
             &mut ctrls[i],
             true,
-            state.sendmsg_einval(),
+            sendmsg_einval,
         );
         hdrs[i].msg_datalen = chunk.len();
         cnt += 1;
     }
-    let Some(sendmsg_x) = state.resolve_apple_fast_fn(sendmsg_x_fn) else {
-        return send_single(state, io, transmit);
-    };
-    retry_if_interrupted(|| unsafe { sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0) })?;
-    Ok(())
+    let sent = retry_if_interrupted(|| unsafe {
+        sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0)
+    })?;
+    Ok(sent as usize)
+}
+
+/// The unsent tail of a partially-completed `sendmsg_x` invocation.
+/// ported from upstream PR #2672.
+#[cfg(apple_fast)]
+#[derive(Debug)]
+struct PartialTransmit {
+    destination: SocketAddr,
+    ecn: Option<EcnCodepoint>,
+    src_ip: Option<IpAddr>,
+    segment_size: usize,
+    buf: Vec<u8>,
 }
 
 #[cfg(any(target_os = "openbsd", target_os = "netbsd", apple_slow))]
@@ -643,7 +828,7 @@ fn sendmsg_x_fn() -> Option<SendmsgXFn> {
     // SAFETY: `resolve_symbol` only returns non-zero addresses obtained from `dlsym`, which
     // guarantees a callable symbol whose type matches the declaration above.
     resolve_symbol(&ADDR, c"sendmsg_x")
-        .map(|addr| unsafe { std::mem::transmute::<usize, SendmsgXFn>(addr) })
+        .map(|addr| unsafe { mem::transmute::<usize, SendmsgXFn>(addr) })
 }
 
 /// Returns the `recvmsg_x` function pointer, resolving it via `dlsym` on first call.
@@ -655,7 +840,7 @@ fn recvmsg_x_fn() -> Option<RecvmsgXFn> {
     // SAFETY: `resolve_symbol` only returns non-zero addresses obtained from `dlsym`, which
     // guarantees a callable symbol whose type matches the declaration above.
     resolve_symbol(&ADDR, c"recvmsg_x")
-        .map(|addr| unsafe { std::mem::transmute::<usize, RecvmsgXFn>(addr) })
+        .map(|addr| unsafe { mem::transmute::<usize, RecvmsgXFn>(addr) })
 }
 
 #[cfg(apple_fast)]
@@ -875,7 +1060,7 @@ fn prepare_recv(
     hdr: &mut libc::msghdr,
 ) {
     hdr.msg_name = name.as_mut_ptr() as _;
-    hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
+    hdr.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
     hdr.msg_iov = buf as *mut IoSliceMut<'_> as *mut libc::iovec;
     hdr.msg_iovlen = 1;
     hdr.msg_control = ctrl.0.as_mut_ptr() as _;
@@ -892,7 +1077,7 @@ fn prepare_recv_x(
     hdr: &mut msghdr_x,
 ) {
     hdr.msg_name = name.as_mut_ptr() as _;
-    hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
+    hdr.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
     hdr.msg_iov = buf as *mut IoSliceMut<'_> as *mut libc::iovec;
     hdr.msg_iovlen = 1;
     hdr.msg_control = ctrl.0.as_mut_ptr() as _;
@@ -959,7 +1144,7 @@ impl ControlMetadata {
                 // https://bugreport.apple.com/web/?problemID=48761855
                 #[allow(clippy::unnecessary_cast)] // cmsg.cmsg_len defined as size_t
                 if cfg!(apple)
-                    && cmsg.cmsg_len as usize == libc::CMSG_LEN(mem::size_of::<u8>() as _) as usize
+                    && cmsg.cmsg_len as usize == libc::CMSG_LEN(size_of::<u8>() as _) as usize
                 {
                     self.ecn_bits = cmsg::decode::<u8, libc::cmsghdr>(cmsg);
                 } else {
@@ -1242,7 +1427,7 @@ fn set_socket_option(
             level,
             name,
             &value as *const _ as _,
-            mem::size_of_val(&value) as _,
+            size_of_val(&value) as _,
         )
     };
 
