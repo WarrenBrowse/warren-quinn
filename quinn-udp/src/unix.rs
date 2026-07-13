@@ -90,6 +90,24 @@ impl UdpSocketState {
 
         io.set_nonblocking(true)?;
 
+        // size the kernel socket buffers to match Quinn's datagram
+        // buffers. The Linux default (~212 KB) drops packets above ~1 Gbps.
+        // Best-effort: a low rmem_max/wmem_max only logs at debug.
+        const DESIRED_RECV_BUF: i32 = 8 * 1024 * 1024;
+        const DESIRED_SEND_BUF: i32 = 4 * 1024 * 1024;
+        if set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_RCVBUF, DESIRED_RECV_BUF).is_err() {
+            crate::log::debug!(
+                "failed to set SO_RCVBUF to {DESIRED_RECV_BUF}, \
+                 kernel rmem_max may be too low"
+            );
+        }
+        if set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_SNDBUF, DESIRED_SEND_BUF).is_err() {
+            crate::log::debug!(
+                "failed to set SO_SNDBUF to {DESIRED_SEND_BUF}, \
+                 kernel wmem_max may be too low"
+            );
+        }
+
         let addr = io.local_addr()?;
         let is_ipv4 = addr.family() == libc::AF_INET as libc::sa_family_t;
 
