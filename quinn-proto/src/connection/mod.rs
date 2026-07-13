@@ -530,7 +530,7 @@ impl Connection {
         let spaces = [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data];
         // This loop will potentially spend multiple iterations in the same `SpaceId`,
         // so we cannot trivially rewrite it to take advantage of `SpaceId::iter()`.
-        while space_idx < spaces.len() {
+        'space_loop: while space_idx < spaces.len() {
             let space_id = spaces[space_idx];
             // Number of bytes available for frames if this is a 1-RTT packet. We're guaranteed to
             // be able to send an individual frame at least this large in the next 1-RTT
@@ -641,7 +641,17 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(MIN_INITIAL_SIZE);
+                        // Configurable floor instead of the hard-coded RFC
+                        // 9000 `MIN_INITIAL_SIZE`. Default reproduces
+                        // upstream behaviour (1200). Clamped to the path MTU:
+                        // `pad_to` has no capacity cap, so a floor above the
+                        // MTU emits an oversized datagram the network drops,
+                        // stalling the handshake.
+                        builder.pad_to(
+                            self.config
+                                .initial_datagram_min_size
+                                .min(self.path.current_mtu()),
+                        );
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -911,8 +921,20 @@ impl Connection {
                 self.next_bundled_ack_time = Some(now + self.next_bundled_ack_delay());
             }
 
+            // If `populate_packet` truncated the first Initial CRYPTO
+            // fragment and handshake bytes are still pending, break out
+            // of the space loop so the current UDP datagram is finalized
+            // here. The remaining CRYPTO data stays in
+            // `space.pending.crypto` and is emitted by the next
+            // `poll_transmit` cycle in a fresh UDP datagram.
+            let force_finish = sent.force_finish_first_datagram;
+
             // Keep information about the packet around until it gets finalized
             sent_frames = Some(sent);
+
+            if force_finish {
+                break 'space_loop;
+            }
 
             // Don't increment space_idx.
             // We stay in the current space and check if there is more data to send.
@@ -921,7 +943,14 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(MIN_INITIAL_SIZE);
+                // Same configurable floor as the main packet-finish
+                // branch above, with the same path-MTU clamp. Default
+                // 1200 = upstream behaviour.
+                builder.pad_to(
+                    self.config
+                        .initial_datagram_min_size
+                        .min(self.path.current_mtu()),
+                );
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
@@ -3280,11 +3309,40 @@ impl Connection {
                 - VarInt::size(unsafe { VarInt::from_u64_unchecked(frame.offset) })
                 - 2; // Maximum encoded length for frame size, given we send less than 2^14 bytes
 
+            // Cap the first CRYPTO fragment on the Initial space so the
+            // handshake tail is written in a follow-up Initial packet
+            // (and a second UDP datagram, once the first is padded near
+            // the path MTU). The cap is keyed on `frame.offset == 0`,
+            // the original first fragment; retransmits and ACK-triggered
+            // re-emissions are subject to the same cap, which is
+            // harmless since the receiver reassembles partial CRYPTO
+            // ranges by offset. Applies to both client and server
+            // Initial spaces; each opts in via its own `TransportConfig`.
+            // `None` (the default) preserves upstream behaviour and
+            // writes as much CRYPTO data as fits.
+            let initial_crypto_first_fragment_cap =
+                if space_id == SpaceId::Initial && frame.offset == 0 {
+                    self.config
+                        .initial_crypto_first_fragment_size
+                        .map_or(usize::MAX, |n| n as usize)
+                } else {
+                    usize::MAX
+                };
+
             let len = frame
                 .data
                 .len()
                 .min(2usize.pow(14) - 1)
-                .min(max_crypto_data_size);
+                .min(max_crypto_data_size)
+                .min(initial_crypto_first_fragment_cap);
+
+            // Whether this iteration was constrained by the fragment
+            // cap. Used below to tell the outer `poll_transmit` loop to
+            // finalize the current UDP datagram once the truncated
+            // CRYPTO has been written, so the remaining handshake bytes
+            // ship in a separate UDP datagram on the next cycle.
+            let split_due_to_first_fragment_cap = initial_crypto_first_fragment_cap != usize::MAX
+                && len >= initial_crypto_first_fragment_cap;
 
             let data = frame.data.split_to(len);
             let truncated = frame::Crypto {
@@ -3299,9 +3357,18 @@ impl Connection {
             truncated.encode(buf);
             self.stats.frame_tx.crypto += 1;
             sent.retransmits.get_or_create().crypto.push_back(truncated);
-            if !frame.data.is_empty() {
+            let crypto_remaining = !frame.data.is_empty();
+            if crypto_remaining {
                 frame.offset += len as u64;
                 space.pending.crypto.push_front(frame);
+            }
+            // If the fragment cap was hit and handshake data remains,
+            // signal the outer transmit loop to finish this datagram so
+            // the tail ships in a separate UDP datagram on the next
+            // `poll_transmit` cycle.
+            if split_due_to_first_fragment_cap && crypto_remaining {
+                sent.force_finish_first_datagram = true;
+                break;
             }
         }
 
@@ -4085,6 +4152,12 @@ struct SentFrames {
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
+    /// Set by `populate_packet` after a capped first-Initial CRYPTO
+    /// fragment write: signals the outer `poll_transmit` loop to
+    /// finalize the current UDP datagram immediately and leave the
+    /// remaining frames for the next cycle, so the handshake tail lands
+    /// in a distinct UDP datagram.
+    force_finish_first_datagram: bool,
 }
 
 impl SentFrames {
