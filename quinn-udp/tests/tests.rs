@@ -96,7 +96,7 @@ fn ecn_v4() {
 #[test]
 #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
 fn ecn_v6_dualstack() {
-    let recv = socket2::Socket::new(
+    let recv = Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
@@ -142,7 +142,7 @@ fn ecn_v6_dualstack() {
 #[test]
 #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
 fn ecn_v4_mapped_v6() {
-    let send = socket2::Socket::new(
+    let send = Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
@@ -218,13 +218,13 @@ fn socket_buffers() {
         1 // Everyone else is sane.
     };
 
-    let send = socket2::Socket::new(
+    let send = Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
     .unwrap();
-    let recv = socket2::Socket::new(
+    let recv = Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
@@ -386,18 +386,22 @@ fn apple_fast_datapath() {
     let send_state = UdpSocketState::new((&send).into()).unwrap();
     let recv_state = UdpSocketState::new((&recv).into()).unwrap();
 
-    // Initially, fast path should be disabled and max_gso_segments should be 1
+    // unlike upstream (opt-in, disabled until set_apple_fast_path), our
+    // fork auto-enables the fast path in `new()` when the private symbols
+    // resolve, since quinn's high-level Endpoint never calls the opt-in. On a
+    // macOS test host the symbols are present, so the fast path is already on
+    // and max_gso_segments is already BATCH_SIZE.
     assert!(
-        !send_state.is_apple_fast_path_enabled(),
-        "fast path should be disabled initially"
+        send_state.is_apple_fast_path_enabled(),
+        "fast path should be auto-enabled by new() on a macOS host"
     );
     assert_eq!(
         send_state.max_gso_segments(),
-        1,
-        "max_gso_segments should be 1 before enabling fast path"
+        quinn_udp::BATCH_SIZE,
+        "max_gso_segments should be BATCH_SIZE once the fast path is enabled"
     );
 
-    // Enable the fast path
+    // Idempotent re-enable (no-op here; keeps the explicit opt-in API exercised).
     // SAFETY: Assume that sendmsg_x/recvmsg_x are available on the macOS test host.
     unsafe {
         send_state.set_apple_fast_path();
@@ -460,4 +464,96 @@ fn apple_fast_datapath() {
         total_received += received_segments;
     }
     assert_eq!(total_received, segments, "should receive all segments");
+}
+
+/// A partial `sendmsg_x` batch must not silently drop its unsent tail.
+///
+/// ported from upstream PR #2672. `sendmsg_x` can accept fewer datagrams
+/// than submitted when the send buffer fills mid-batch. Shrinking `SO_SNDBUF`
+/// well below one batch forces that on essentially every call. Every datagram
+/// handed to the socket must still arrive exactly once and in order, none
+/// dropped, duplicated, or reordered, even as the unsent tail is carried over to
+/// the following send. (This test fails against upstream 0.6.1, which ignores
+/// the `sendmsg_x` return value and drops the tail.)
+#[test]
+#[cfg(apple_fast)]
+fn apple_fast_partial_send_is_not_dropped() {
+    let send = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let dst_addr = recv.local_addr().unwrap();
+
+    let send_state = UdpSocketState::new((&send).into()).unwrap();
+
+    // SAFETY: assume `sendmsg_x`/`recvmsg_x` are available on the macOS test host.
+    unsafe {
+        send_state.set_apple_fast_path();
+    }
+
+    let segments = send_state.max_gso_segments();
+    assert!(segments > 1, "fast path should batch multiple datagrams");
+
+    const SEGMENT_SIZE: usize = 1024;
+
+    // A send buffer far smaller than a full batch makes each `sendmsg_x` accept
+    // only part of the batch, exercising the carry-over of the unsent tail.
+    send_state
+        .set_send_buffer_size((&send).into(), SEGMENT_SIZE * 4)
+        .unwrap();
+
+    recv.set_nonblocking(true).unwrap();
+
+    // Datagrams we require delivered before declaring success. Kept below 256 so
+    // each datagram's global index fits in the single-byte tag.
+    let target = (segments * 4).min(200);
+
+    let mut next_to_send = 0usize;
+    let mut received: Vec<usize> = Vec::with_capacity(target);
+    let mut buf = [0u8; u16::MAX as usize];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    while received.len() < target {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after receiving {}/{target} datagrams; tail was dropped",
+            received.len()
+        );
+
+        let mut msg = vec![0u8; SEGMENT_SIZE * segments];
+        for i in 0..segments {
+            msg[i * SEGMENT_SIZE] = ((next_to_send + i) % 256) as u8;
+        }
+        match send_state.try_send(
+            (&send).into(),
+            &Transmit {
+                destination: dst_addr,
+                ecn: None,
+                contents: &msg,
+                segment_size: Some(SEGMENT_SIZE),
+                src_ip: None,
+            },
+        ) {
+            Ok(()) => next_to_send += segments,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("unexpected send error: {e}"),
+        }
+
+        loop {
+            match recv.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    assert_eq!(n, SEGMENT_SIZE, "unexpected datagram length");
+                    received.push(buf[0] as usize);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("unexpected recv error: {e}"),
+            }
+        }
+    }
+
+    for (i, &tag) in received.iter().enumerate() {
+        assert_eq!(
+            tag,
+            i % 256,
+            "datagram {i} arrived as tag {tag}: a partial send dropped, duplicated, or reordered the batch tail"
+        );
+    }
 }
