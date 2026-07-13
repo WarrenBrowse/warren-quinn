@@ -58,6 +58,21 @@ web-time = "1"
 windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
 cfg_aliases = "0.2"
 
+# quinn-udp 0.6.1 (overlaid from the upstream main lineage onto this 0.11.x
+# base) opts into `[lints] workspace = true`, so the 0.11.x workspace root
+# must define these. Copied verbatim from upstream main; all `warn`.
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+manual_let_else = "warn"
+or_fun_call = "warn"
+use_self = "warn"
+
 [profile.bench]
 debug = true
 
