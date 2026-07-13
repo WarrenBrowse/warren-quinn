@@ -53,6 +53,21 @@ impl UdpSocketState {
         );
 
         socket.0.set_nonblocking(true)?;
+
+        // size the kernel socket buffers to match Quinn's datagram
+        // buffers. Windows defaults drop packets under sustained high
+        // throughput, mirroring the Unix tuning. Best-effort: failures only
+        // log at debug. Upstream sizes these on Unix only; this closes the
+        // Windows gap.
+        const DESIRED_RECV_BUF: usize = 8 * 1024 * 1024;
+        const DESIRED_SEND_BUF: usize = 4 * 1024 * 1024;
+        if let Err(_e) = socket.0.set_recv_buffer_size(DESIRED_RECV_BUF) {
+            debug!("quinn-udp: failed to set SO_RCVBUF to {DESIRED_RECV_BUF}: {_e}");
+        }
+        if let Err(_e) = socket.0.set_send_buffer_size(DESIRED_SEND_BUF) {
+            debug!("quinn-udp: failed to set SO_SNDBUF to {DESIRED_SEND_BUF}: {_e}");
+        }
+
         let addr = socket.0.local_addr()?;
         let is_ipv6 = addr.as_socket_ipv6().is_some();
         let v6only = unsafe {
