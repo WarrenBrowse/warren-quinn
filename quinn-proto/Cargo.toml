@@ -1,6 +1,11 @@
 [package]
-name = "quinn-proto"
-version = "0.11.17"
+name = "warren-quinn-proto"
+# The `-fork.<N>` pre-release suffix locks the workspace `[patch.crates-io]`
+# entry to this fork. The fork level N is repo-wide, bumped in lockstep across
+# the three crates on every fork-side patch so a stale `Cargo.lock` cannot
+# silently drag the upstream crate back in. Base: upstream quinn-proto 0.11.17
+# (branch 0.11.x).
+version = "0.11.17-fork.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,6 +14,9 @@ description = "State machine for the QUIC transport protocol"
 keywords.workspace = true
 categories.workspace = true
 workspace = ".."
+
+[lib]
+name = "quinn_proto"
 
 [features]
 # NOTE: Please keep this in sync with the feature list in `.github/workflows/codecov.yml`, see
