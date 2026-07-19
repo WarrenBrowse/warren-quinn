@@ -1,9 +1,28 @@
 # Upstream PR plan: Initial-packet fragmentation + padding control
 
-This fork carries four deltas vs upstream quinn. Only the **two
-Initial-fragmentation knobs** are proposed for upstream; the GSO constants,
-socket-buffer sizing and Apple fast-datapath port are deployment tuning and
-stay fork-local.
+This fork carries six deltas vs upstream quinn. Two are proposed for
+upstream: the **two Initial-fragmentation knobs** (this document) and the
+**BBR STARTUP cwnd bound fix** (below). The GSO constants, socket-buffer
+sizing, Apple fast-datapath port and datagram-queue AQM are deployment
+tuning and stay fork-local.
+
+## Second upstream candidate: BBR STARTUP cwnd bound fix
+
+`quinn-proto/src/congestion/bbr/mod.rs`, `calculate_cwnd`: the STARTUP
+growth condition reads `self.cwnd_gain < target_window as f32`, comparing a
+gain factor (~2.885) against a byte count, which is always true; STARTUP
+cwnd therefore grows by every acked byte with no target_window bound. Any
+connection that stays app-limited (which skips full-bandwidth detection,
+and becomes self-sustaining once cwnd outruns the real BDP: the sender is
+never congestion-blocked again) keeps STARTUP forever and grows an
+unbounded window - we measured half-gigabyte cwnds on production VPN-exit
+connections. The reference implementations (Chromium/quiche
+`BbrSender::CalculateCongestionWindow`) compare `congestion_window` against
+`target_window`. The fix is that one-token substitution; the patch
+(`upstream-bbr-startup-cwnd.patch`) carries it with two regression tests
+(`congestion::bbr::tests`) and a `pub(crate)` widening of
+`RttEstimator::new` the tests need. The same line is present on upstream
+main, so the patch should port trivially past the 0.11 line.
 
 ## Scope of the PR (isolate these, drop the rest)
 

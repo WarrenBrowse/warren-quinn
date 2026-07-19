@@ -74,6 +74,26 @@ old tags are unaffected; only `main` was rebuilt.
    `sendmsg_x`/`recvmsg_x` symbols resolve. Includes release hardening beyond
    the PR: an out-of-contract `Ok(0)` from `sendmsg_x` is treated as
    backpressure (`WouldBlock`) instead of spinning on a zero-progress loop.
+5. **BBR STARTUP cwnd bound fix** (upstream bug): `calculate_cwnd` compared
+   `cwnd_gain` (a gain factor) against `target_window` (bytes), a condition
+   that is always true, so a connection stuck in STARTUP (every app-limited
+   round skips full-bandwidth detection, and a tunnel is app-limited whenever
+   inner traffic does not fill the window) grew cwnd by every acked byte,
+   unbounded. Observed in production: half-gigabyte congestion windows on
+   VPN-exit connections, i.e. congestion control effectively off. The fix
+   compares `cwnd` as upstream Chromium/quiche does; regression-tested by
+   `congestion::bbr::tests` (app-limited STARTUP stays near target_window,
+   ramp below target still grows). Proposed for upstream.
+6. **Datagram send-queue AQM** (`TransportConfig::datagram_send_aqm`,
+   CoDel/RFC 8289): the outgoing datagram buffer is a deep FIFO; on a path
+   slower than the offered load it holds seconds of standing queue before the
+   drop-oldest overflow fires. With the AQM (on by default: 15 ms target /
+   100 ms interval), queue heads whose sojourn time keeps the queue above
+   target for a full interval are head-dropped with the CoDel control law,
+   bounding queue latency at any link speed; drops are counted in the new
+   `ConnectionStats::datagram_tx` (`dropped_aqm`, plus `dropped_overflow` for
+   the pre-existing silent overflow evictions). `send`/`write` now carry
+   `now: Instant` for sojourn timestamping.
 
 ## Patch files (portable form of the deltas)
 
@@ -101,8 +121,16 @@ the primary upgrade path is now a plain `git rebase`.
   renamed Cargo.toml files, so on a pristine upstream base apply the patches
   in the order listed here and fix the manifest context by hand.
 
+- `upstream-bbr-startup-cwnd.patch`: the BBR STARTUP cwnd bound fix (delta 5)
+  plus its regression tests and the `pub(crate)` widening of
+  `RttEstimator::new` they need. Applies clean on `a96949f6`; the same
+  one-token bug is present on upstream main.
+- `fork-datagram-aqm.patch`: the CoDel datagram-queue AQM (delta 6): config,
+  queue timestamping, dequeue-time controller, drop stats, and the
+  `now`-carrying `send`/`write` signatures with their call-site updates.
+
 The `fork-` prefix marks deltas that stay fork-local per `UPSTREAM-PR.md`;
-only the `upstream-` patch is intended for submission.
+the `upstream-` patches are intended for submission.
 
 **Moving to a new upstream 0.11.x state**: `git rebase` the fork commits onto
 the new upstream commit (or merge upstream in), re-run the proto and udp test
