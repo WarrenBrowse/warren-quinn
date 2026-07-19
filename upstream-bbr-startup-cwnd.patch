@@ -1,5 +1,29 @@
+diff --git a/quinn-proto/src/congestion/bbr/bw_estimation.rs b/quinn-proto/src/congestion/bbr/bw_estimation.rs
+index 84ea4e68..8be252d4 100644
+--- a/quinn-proto/src/congestion/bbr/bw_estimation.rs
++++ b/quinn-proto/src/congestion/bbr/bw_estimation.rs
+@@ -62,7 +62,18 @@ impl BandwidthEstimation {
+         };
+ 
+         let bandwidth = send_rate.min(ack_rate);
+-        if !app_limited && self.max_filter.get() < bandwidth {
++        // Mirror Chromium/quiche's admission rule: non-app-limited samples
++        // always feed the windowed max filter (feeding lower samples too is
++        // what lets the window rotate and the estimate decay); app-limited
++        // samples are admitted only when they RAISE the estimate, because a
++        // path cannot fake delivering faster than it can, while a low
++        // app-limited sample says nothing about capacity. Gating app-limited
++        // samples out entirely left the filter empty on connections that are
++        // app-limited from birth (a tunnel trickling below link rate), and a
++        // zero estimate collapses the ack-aggregation epoch arithmetic into
++        // unbounded excess_acked growth. Zero-rate artifacts (same-instant
++        // deltas) are never admitted.
++        if bandwidth > 0 && (!app_limited || bandwidth > self.max_filter.get()) {
+             self.max_filter.update_max(round, bandwidth);
+         }
+     }
 diff --git a/quinn-proto/src/congestion/bbr/mod.rs b/quinn-proto/src/congestion/bbr/mod.rs
-index c46bc4eb..6a0c2dfe 100644
+index c46bc4eb..35f18fe4 100644
 --- a/quinn-proto/src/congestion/bbr/mod.rs
 +++ b/quinn-proto/src/congestion/bbr/mod.rs
 @@ -324,7 +324,7 @@ impl Bbr {
@@ -11,7 +35,7 @@ index c46bc4eb..6a0c2dfe 100644
              // If the connection is not yet out of startup phase, do not decrease
              // the window.
              self.cwnd += bytes_acked;
-@@ -649,3 +649,142 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
+@@ -649,3 +649,188 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
  
  const PROBE_RTT_BASED_ON_BDP: bool = true;
  const DRAIN_TO_TARGET: bool = true;
@@ -98,6 +122,52 @@ index c46bc4eb..6a0c2dfe 100644
 +        assert!(
 +            bbr.cwnd <= 4 * bbr.init_cwnd,
 +            "STARTUP cwnd must stay near the BDP-derived target, got {} after {} bytes acked (init_cwnd {})",
++            bbr.cwnd,
++            bbr.acked_bytes,
++            bbr.init_cwnd
++        );
++    }
++
++    #[test]
++    fn app_limited_from_birth_does_not_grow_cwnd_unbounded() {
++        // A connection that is app-limited from its very first round (a
++        // tunnel trickling below link rate, never saturating) exercises the
++        // OTHER unbounded-growth path: with no bandwidth samples admitted to
++        // the max filter, expected_bytes_acked stays 0, the ack-aggregation
++        // epoch never resets, and excess_acked = cumulative acked bytes
++        // inflates target_window without bound. App-limited samples must be
++        // allowed to RAISE the bandwidth estimate (they are real deliveries;
++        // a path cannot fake delivering faster than it can) so the epoch
++        // arithmetic engages and the window stays near the real BDP.
++        let mut now = Instant::now();
++        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
++        bbr.probe_rtt_last_started_at = Some(now);
++        bbr.min_rtt = Duration::from_millis(20);
++        let rtt = RttEstimator::new(Duration::from_millis(20));
++        let mut pn = 0u64;
++
++        // 500 rounds of a paced ~13 Mbit/s stream (33 x 1200 B per 20 ms
++        // round, 600 us spacing), app-limited from the first byte.
++        for _ in 0..500 {
++            now = run_round(
++                &mut bbr,
++                &rtt,
++                now,
++                &mut pn,
++                33,
++                1200,
++                Duration::from_micros(600),
++                true,
++            );
++        }
++        assert_eq!(bbr.mode, Mode::Startup);
++        assert!(
++            bbr.acked_bytes > 20 * bbr.init_cwnd,
++            "scenario sanity: plenty of bytes must have been acked"
++        );
++        assert!(
++            bbr.cwnd <= 4 * bbr.init_cwnd,
++            "app-limited-from-birth cwnd must stay bounded, got {} after {} bytes acked (init_cwnd {})",
 +            bbr.cwnd,
 +            bbr.acked_bytes,
 +            bbr.init_cwnd

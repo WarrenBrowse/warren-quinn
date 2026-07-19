@@ -74,16 +74,28 @@ old tags are unaffected; only `main` was rebuilt.
    `sendmsg_x`/`recvmsg_x` symbols resolve. Includes release hardening beyond
    the PR: an out-of-contract `Ok(0)` from `sendmsg_x` is treated as
    backpressure (`WouldBlock`) instead of spinning on a zero-progress loop.
-5. **BBR STARTUP cwnd bound fix** (upstream bug): `calculate_cwnd` compared
-   `cwnd_gain` (a gain factor) against `target_window` (bytes), a condition
-   that is always true, so a connection stuck in STARTUP (every app-limited
-   round skips full-bandwidth detection, and a tunnel is app-limited whenever
-   inner traffic does not fill the window) grew cwnd by every acked byte,
-   unbounded. Observed in production: half-gigabyte congestion windows on
-   VPN-exit connections, i.e. congestion control effectively off. The fix
-   compares `cwnd` as upstream Chromium/quiche does; regression-tested by
-   `congestion::bbr::tests` (app-limited STARTUP stays near target_window,
-   ramp below target still grows). Proposed for upstream.
+5. **BBR STARTUP cwnd bound fix** (upstream bugs, two related port defects):
+   (a) `calculate_cwnd` compared `cwnd_gain` (a gain factor) against
+   `target_window` (bytes), a condition that is always true, so a connection
+   stuck in STARTUP (every app-limited round skips full-bandwidth detection,
+   and a tunnel is app-limited whenever inner traffic does not fill the
+   window) grew cwnd by every acked byte, unbounded. The fix compares `cwnd`
+   as upstream Chromium/quiche does. (b) the bandwidth estimator refused
+   app-limited samples entirely (`!app_limited && ...`), so a connection
+   app-limited from birth kept a zero estimate; with
+   `expected_bytes_acked = 0` the ack-aggregation epoch never resets and
+   `excess_acked` (= cumulative acked bytes) re-inflates `target_window`
+   without bound, reopening the same hole (a) closed. quiche's admission
+   rule is restored: non-app-limited samples always feed the windowed max
+   filter (which is also what lets the estimate decay), app-limited samples
+   only when they raise it. Observed in production before the fixes:
+   half-gigabyte congestion windows on VPN-exit connections, i.e.
+   congestion control effectively off; reproduced deterministically by the
+   warren-core `lastmile-paired.sh` harness (cwnd == cumulative acked bytes
+   after 30 s of app-limited streaming). Regression-tested by
+   `congestion::bbr::tests` (seeded and from-birth app-limited scenarios
+   stay near target_window; ramp below target still grows). Proposed for
+   upstream.
 6. **Datagram send-queue AQM** (`TransportConfig::datagram_send_aqm`,
    CoDel/RFC 8289): the outgoing datagram buffer is a deep FIFO; on a path
    slower than the offered load it holds seconds of standing queue before the

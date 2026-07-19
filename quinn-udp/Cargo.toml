@@ -2,7 +2,7 @@
 name = "warren-quinn-udp"
 # Same repo-wide `-fork.<N>` level as the sibling crates. Base: upstream
 # quinn-udp 0.6.1 (tag `quinn-udp-0.6.1`, main lineage).
-version = "0.6.1-fork.9"
+version = "0.6.1-fork.10"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

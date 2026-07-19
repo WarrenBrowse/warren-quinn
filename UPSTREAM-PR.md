@@ -8,21 +8,35 @@ tuning and stay fork-local.
 
 ## Second upstream candidate: BBR STARTUP cwnd bound fix
 
-`quinn-proto/src/congestion/bbr/mod.rs`, `calculate_cwnd`: the STARTUP
-growth condition reads `self.cwnd_gain < target_window as f32`, comparing a
-gain factor (~2.885) against a byte count, which is always true; STARTUP
-cwnd therefore grows by every acked byte with no target_window bound. Any
-connection that stays app-limited (which skips full-bandwidth detection,
-and becomes self-sustaining once cwnd outruns the real BDP: the sender is
-never congestion-blocked again) keeps STARTUP forever and grows an
-unbounded window - we measured half-gigabyte cwnds on production VPN-exit
-connections. The reference implementations (Chromium/quiche
-`BbrSender::CalculateCongestionWindow`) compare `congestion_window` against
-`target_window`. The fix is that one-token substitution; the patch
-(`upstream-bbr-startup-cwnd.patch`) carries it with two regression tests
-(`congestion::bbr::tests`) and a `pub(crate)` widening of
-`RttEstimator::new` the tests need. The same line is present on upstream
-main, so the patch should port trivially past the 0.11 line.
+Two related port defects versus Chromium/quiche, one combined patch
+(`upstream-bbr-startup-cwnd.patch`):
+
+1. `quinn-proto/src/congestion/bbr/mod.rs`, `calculate_cwnd`: the STARTUP
+   growth condition reads `self.cwnd_gain < target_window as f32`, comparing
+   a gain factor (~2.885) against a byte count, which is always true; STARTUP
+   cwnd therefore grows by every acked byte with no target_window bound. Any
+   connection that stays app-limited (which skips full-bandwidth detection,
+   and becomes self-sustaining once cwnd outruns the real BDP: the sender is
+   never congestion-blocked again) keeps STARTUP forever and grows an
+   unbounded window - we measured half-gigabyte cwnds on production VPN-exit
+   connections. quiche's `BbrSender::CalculateCongestionWindow` compares
+   `congestion_window`; the fix is that one-token substitution.
+2. `quinn-proto/src/congestion/bbr/bw_estimation.rs`, `on_ack`: bandwidth
+   samples were admitted only when `!app_limited`, so a connection that is
+   app-limited from birth keeps a zero estimate. `expected_bytes_acked` is
+   then 0, the ack-aggregation epoch never resets, and `excess_acked`
+   equals cumulative acked bytes, re-inflating `target_window` without
+   bound even with fix 1 applied (caught by a real-network A/B harness the
+   unit test's seeded bandwidth had masked). quiche admits app-limited
+   samples when they RAISE the estimate (a path cannot fake delivering
+   faster than it can) and always admits non-app-limited samples, which is
+   also what lets the windowed max filter rotate and decay; the fix
+   restores both admissions and rejects zero-rate same-instant artifacts.
+
+Three regression tests in `congestion::bbr::tests` (seeded app-limited,
+app-limited-from-birth, below-target ramp) plus a `pub(crate)` widening of
+`RttEstimator::new` they need. The same lines are present on upstream main,
+so the patch should port trivially past the 0.11 line.
 
 ## Scope of the PR (isolate these, drop the rest)
 

@@ -3,7 +3,7 @@ name = "warren-quinn"
 # Same `<upstream-base>-fork.<N>` scheme as warren-quinn-proto, bumped in
 # lockstep so the manifest reflects the repo-wide fork level. Upstream base:
 # quinn 0.11.11 (tag `quinn-0.11.11`, on branch 0.11.x).
-version = "0.11.11-fork.9"
+version = "0.11.11-fork.10"
 license.workspace = true
 repository.workspace = true
 description = "Versatile QUIC transport protocol implementation"
@@ -65,13 +65,13 @@ bytes = { workspace = true }
 futures-io = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 pin-project-lite = { workspace = true }
-proto = { package = "warren-quinn-proto", path = "../quinn-proto", version = "0.11.16-fork.9", default-features = false }
+proto = { package = "warren-quinn-proto", path = "../quinn-proto", version = "0.11.16-fork.10", default-features = false }
 rustls = { workspace = true, optional = true }
 smol = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing =  { workspace = true }
 tokio = { workspace = true }
-udp = { package = "warren-quinn-udp", path = "../quinn-udp", version = "0.6.1-fork.9", default-features = false, features = ["tracing"] }
+udp = { package = "warren-quinn-udp", path = "../quinn-udp", version = "0.6.1-fork.10", default-features = false, features = ["tracing"] }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 socket2 = { workspace = true }
