@@ -157,6 +157,21 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+/// Statistics about the outgoing application-datagram queue
+///
+/// Datagrams queued by `send_datagram` wait in a send buffer until the
+/// connection can transmit them. Both counters here are drops that happen
+/// silently from the sender's point of view (`send_datagram` returned `Ok`),
+/// so they are the only visibility an application has into queue pressure.
+#[derive(Default, Debug, Copy, Clone)]
+#[non_exhaustive]
+pub struct DatagramTxStats {
+    /// Datagrams evicted because the send buffer was full (drop-oldest)
+    pub dropped_overflow: u64,
+    /// Datagrams head-dropped by the CoDel AQM (queue sojourn above target)
+    pub dropped_aqm: u64,
+}
+
 /// Connection statistics
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
@@ -171,4 +186,6 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// Statistics about the outgoing application-datagram queue
+    pub datagram_tx: DatagramTxStats,
 }
