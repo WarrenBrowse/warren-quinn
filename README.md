@@ -144,6 +144,14 @@ the primary upgrade path is now a plain `git rebase`.
 The `fork-` prefix marks deltas that stay fork-local per `UPSTREAM-PR.md`;
 the `upstream-` patches are intended for submission.
 
+**Cutting a new fork tag**: derive the next `-fork.N` from
+`git tag -l 'v*-fork.*' | sort -V | tail -1` and cross-check
+`git ls-remote --tags origin`. Never a bare `git tag -l | tail`: tag listings
+sort lexicographically and hide double-digit versions behind single-digit ones
+(the 2026-07-19 warren-app v1.9.1-vs-v1.11.0 mis-tag class). Consumers pin
+fork tags explicitly, so a mis-numbered tag confuses pins rather than shipping
+a regression, but the discipline is the same.
+
 **Moving to a new upstream 0.11.x state**: `git rebase` the fork commits onto
 the new upstream commit (or merge upstream in), re-run the proto and udp test
 suites (`cargo test -p warren-quinn-proto`, `cargo test -p warren-quinn-udp
