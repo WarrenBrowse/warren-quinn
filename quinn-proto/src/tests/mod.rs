@@ -1814,9 +1814,10 @@ fn tail_loss_small_segment_size() {
     // sending a ping.  These are small enough that the segment_size is less than the
     // INITIAL_MTU.
     info!("Sending datagram batch");
+    let now = pair.time;
     for _ in 0..DGRAM_NUM {
         pair.client_datagrams(client_ch)
-            .send(vec![0; DGRAM_LEN].into(), false)
+            .send(vec![0; DGRAM_LEN].into(), false, now)
             .unwrap();
     }
 
@@ -1861,9 +1862,10 @@ fn tail_loss_respect_max_datagrams() {
 
     // start sending datagram batches but the first should be a TLP
     info!("Sending datagram batch");
+    let now = pair.time;
     for _ in 0..DGRAM_NUM {
         pair.client_datagrams(client_ch)
-            .send(vec![0; DGRAM_LEN].into(), false)
+            .send(vec![0; DGRAM_LEN].into(), false, now)
             .unwrap();
     }
 
@@ -1883,8 +1885,9 @@ fn datagram_send_recv() {
     assert_matches!(pair.client_datagrams(client_ch).max_size(), Some(x) if x > 0);
 
     const DATA: &[u8] = b"whee";
+    let now = pair.time;
     pair.client_datagrams(client_ch)
-        .send(DATA.into(), true)
+        .send(DATA.into(), true, now)
         .unwrap();
     pair.drive();
     assert_matches!(
@@ -1917,14 +1920,15 @@ fn datagram_recv_buffer_overflow() {
     const DATA1: &[u8] = &[0xAB; (WINDOW / 3) + 1];
     const DATA2: &[u8] = &[0xBC; (WINDOW / 3) + 1];
     const DATA3: &[u8] = &[0xCD; (WINDOW / 3) + 1];
+    let now = pair.time;
     pair.client_datagrams(client_ch)
-        .send(DATA1.into(), true)
+        .send(DATA1.into(), true, now)
         .unwrap();
     pair.client_datagrams(client_ch)
-        .send(DATA2.into(), true)
+        .send(DATA2.into(), true, now)
         .unwrap();
     pair.client_datagrams(client_ch)
-        .send(DATA3.into(), true)
+        .send(DATA3.into(), true, now)
         .unwrap();
     pair.drive();
     assert_matches!(
@@ -1935,8 +1939,9 @@ fn datagram_recv_buffer_overflow() {
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA3);
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 
+    let now = pair.time;
     pair.client_datagrams(client_ch)
-        .send(DATA1.into(), true)
+        .send(DATA1.into(), true, now)
         .unwrap();
     pair.drive();
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA1);
@@ -1958,7 +1963,11 @@ fn datagram_unsupported() {
     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
     assert_matches!(pair.client_datagrams(client_ch).max_size(), None);
 
-    match pair.client_datagrams(client_ch).send(Bytes::new(), true) {
+    let now = pair.time;
+    match pair
+        .client_datagrams(client_ch)
+        .send(Bytes::new(), true, now)
+    {
         Err(SendDatagramError::UnsupportedByPeer) => {}
         Err(e) => panic!("unexpected error: {e}"),
         Ok(_) => panic!("unexpected success"),
@@ -3056,8 +3065,9 @@ fn pure_sender_voluntarily_acks() {
 
     for _ in 0..100 {
         const MSG: &[u8] = b"hello";
+        let now = pair.time;
         pair.client_datagrams(client_ch)
-            .send(Bytes::from_static(MSG), true)
+            .send(Bytes::from_static(MSG), true, now)
             .unwrap();
         pair.drive();
         assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), MSG);
@@ -3194,8 +3204,9 @@ fn datagram_gso() {
     const DATAGRAM_LEN: usize = 1024;
     const DATAGRAMS: usize = 10;
     for _ in 0..DATAGRAMS {
+        let now = pair.time;
         pair.client_datagrams(client_ch)
-            .send(Bytes::from_static(&[0; DATAGRAM_LEN]), false)
+            .send(Bytes::from_static(&[0; DATAGRAM_LEN]), false, now)
             .unwrap();
     }
     pair.drive();
@@ -3222,9 +3233,10 @@ fn gso_truncation() {
     // produce a QUIC packet of the same length as the first.
     info!("sending");
     const SIZES: [usize; 3] = [1024, 768, 768];
+    let now = pair.time;
     for len in SIZES {
         pair.client_datagrams(client_ch)
-            .send(vec![0; len].into(), false)
+            .send(vec![0; len].into(), false, now)
             .unwrap();
     }
     pair.drive();
@@ -3267,11 +3279,12 @@ fn pad_to_mtu() {
     // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
     const LEN_1: usize = 800;
     const LEN_2: usize = 600;
+    let now = pair.time;
     pair.client_datagrams(client_ch)
-        .send(vec![0; LEN_1].into(), false)
+        .send(vec![0; LEN_1].into(), false, now)
         .unwrap();
     pair.client_datagrams(client_ch)
-        .send(vec![0; LEN_2].into(), false)
+        .send(vec![0; LEN_2].into(), false, now)
         .unwrap();
     pair.client.drive(pair.time, pair.server.addr);
 
@@ -3326,8 +3339,9 @@ fn large_datagram_with_acks() {
 
     let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
     let msg = Bytes::from(vec![0; max_size]);
+    let now = pair.time;
     pair.client_datagrams(client_ch)
-        .send(msg.clone(), true)
+        .send(msg.clone(), true, now)
         .unwrap();
     let initial_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
     pair.drive();
@@ -3350,9 +3364,10 @@ fn voluntary_ack_with_large_datagrams() {
     // larger ACKs occur
     const COUNT: usize = 256;
     for _ in 0..COUNT {
+        let now = pair.time;
         let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
         pair.client_datagrams(client_ch)
-            .send(vec![0; max_size].into(), true)
+            .send(vec![0; max_size].into(), true, now)
             .unwrap();
         pair.drive();
     }

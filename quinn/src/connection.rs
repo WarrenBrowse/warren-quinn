@@ -439,7 +439,7 @@ impl Connection {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
         use proto::SendDatagramError::*;
-        match conn.inner.datagrams().send(data, true) {
+        match conn.inner.datagrams().send(data, true, Instant::now()) {
             Ok(()) => {
                 conn.wake();
                 Ok(())
@@ -846,7 +846,7 @@ impl Future for SendDatagram<'_> {
         match state
             .inner
             .datagrams()
-            .send(this.data.take().unwrap(), false)
+            .send(this.data.take().unwrap(), false, Instant::now())
         {
             Ok(()) => {
                 state.wake();

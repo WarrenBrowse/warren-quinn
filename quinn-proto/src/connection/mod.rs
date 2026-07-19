@@ -3397,7 +3397,13 @@ impl Connection {
         // DATAGRAM
         let mut sent_datagrams = false;
         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
-            match self.datagrams.write(buf, max_size) {
+            match self.datagrams.write(
+                buf,
+                max_size,
+                now,
+                self.config.datagram_send_aqm.as_ref(),
+                &mut self.stats.datagram_tx,
+            ) {
                 true => {
                     sent_datagrams = true;
                     sent.non_retransmits = true;
@@ -3743,7 +3749,7 @@ impl Connection {
                 .datagrams
                 .outgoing
                 .front()
-                .is_some_and(|x| x.size(true) <= max_size)
+                .is_some_and(|x| x.frame_size(true) <= max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned

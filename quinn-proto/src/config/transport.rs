@@ -54,6 +54,7 @@ pub struct TransportConfig {
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
+    pub(crate) datagram_send_aqm: Option<DatagramAqmConfig>,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -347,6 +348,26 @@ impl TransportConfig {
         self
     }
 
+    /// Active queue management for the outgoing datagram send buffer
+    ///
+    /// A deep send buffer bounds memory, but on a path slower than the
+    /// application's offered load it becomes a standing queue: every datagram
+    /// waits behind the backlog, adding up to seconds of latency while the
+    /// buffer keeps absorbing instead of signalling. With an AQM configured,
+    /// datagrams whose queue sojourn time stays above `target` for longer
+    /// than `interval` are head-dropped (CoDel, RFC 8289), which bounds
+    /// queue latency at any link speed and gives loss-responsive inner
+    /// traffic (e.g. tunnelled TCP) its congestion signal within one RTT
+    /// instead of after a timeout. Transient bursts shorter than `interval`
+    /// are never dropped.
+    ///
+    /// `None` disables the AQM: the buffer then only drops oldest-first on
+    /// overflow. Defaults to enabled with [`DatagramAqmConfig::default`].
+    pub fn datagram_send_aqm(&mut self, value: Option<DatagramAqmConfig>) -> &mut Self {
+        self.datagram_send_aqm = value;
+        self
+    }
+
     /// Whether to force every packet number to be used
     ///
     /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
@@ -436,6 +457,7 @@ impl Default for TransportConfig {
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
+            datagram_send_aqm: Some(DatagramAqmConfig::default()),
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -474,6 +496,7 @@ impl fmt::Debug for TransportConfig {
             allow_spin,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
+            datagram_send_aqm,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -511,6 +534,7 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
+            .field("datagram_send_aqm", datagram_send_aqm)
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload);
         if cfg!(feature = "qlog") {
@@ -799,6 +823,46 @@ impl Default for MtuDiscoveryConfig {
             upper_bound: 1452,
             black_hole_cooldown: Duration::from_secs(60),
             minimum_change: 20,
+        }
+    }
+}
+
+/// Parameters for the outgoing-datagram queue AQM (CoDel, RFC 8289)
+///
+/// See [`TransportConfig::datagram_send_aqm`].
+#[derive(Debug, Copy, Clone)]
+pub struct DatagramAqmConfig {
+    pub(crate) target: Duration,
+    pub(crate) interval: Duration,
+}
+
+impl DatagramAqmConfig {
+    /// Acceptable queue sojourn time for a datagram waiting in the send buffer.
+    ///
+    /// Sojourn persistently above this starts head-dropping. Defaults to
+    /// 15 ms: looser than the classic 5 ms router setting because this queue
+    /// feeds a congestion-controlled connection whose window growth
+    /// legitimately queues a few RTTs of data during ramp-up.
+    pub fn target(&mut self, value: Duration) -> &mut Self {
+        self.target = value;
+        self
+    }
+
+    /// Sliding window over which the sojourn time must stay above `target`
+    /// before the first drop, and the base period of the drop-rate ramp.
+    ///
+    /// Defaults to 100 ms (the RFC 8289 recommendation, a worst-case RTT).
+    pub fn interval(&mut self, value: Duration) -> &mut Self {
+        self.interval = value;
+        self
+    }
+}
+
+impl Default for DatagramAqmConfig {
+    fn default() -> Self {
+        Self {
+            target: Duration::from_millis(15),
+            interval: Duration::from_millis(100),
         }
     }
 }
