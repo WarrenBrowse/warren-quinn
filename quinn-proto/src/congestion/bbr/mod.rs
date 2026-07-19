@@ -739,6 +739,52 @@ mod tests {
     }
 
     #[test]
+    fn app_limited_from_birth_does_not_grow_cwnd_unbounded() {
+        // A connection that is app-limited from its very first round (a
+        // tunnel trickling below link rate, never saturating) exercises the
+        // OTHER unbounded-growth path: with no bandwidth samples admitted to
+        // the max filter, expected_bytes_acked stays 0, the ack-aggregation
+        // epoch never resets, and excess_acked = cumulative acked bytes
+        // inflates target_window without bound. App-limited samples must be
+        // allowed to RAISE the bandwidth estimate (they are real deliveries;
+        // a path cannot fake delivering faster than it can) so the epoch
+        // arithmetic engages and the window stays near the real BDP.
+        let mut now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.probe_rtt_last_started_at = Some(now);
+        bbr.min_rtt = Duration::from_millis(20);
+        let rtt = RttEstimator::new(Duration::from_millis(20));
+        let mut pn = 0u64;
+
+        // 500 rounds of a paced ~13 Mbit/s stream (33 x 1200 B per 20 ms
+        // round, 600 us spacing), app-limited from the first byte.
+        for _ in 0..500 {
+            now = run_round(
+                &mut bbr,
+                &rtt,
+                now,
+                &mut pn,
+                33,
+                1200,
+                Duration::from_micros(600),
+                true,
+            );
+        }
+        assert_eq!(bbr.mode, Mode::Startup);
+        assert!(
+            bbr.acked_bytes > 20 * bbr.init_cwnd,
+            "scenario sanity: plenty of bytes must have been acked"
+        );
+        assert!(
+            bbr.cwnd <= 4 * bbr.init_cwnd,
+            "app-limited-from-birth cwnd must stay bounded, got {} after {} bytes acked (init_cwnd {})",
+            bbr.cwnd,
+            bbr.acked_bytes,
+            bbr.init_cwnd
+        );
+    }
+
+    #[test]
     fn startup_cwnd_grows_while_below_target_window() {
         let mut now = Instant::now();
         let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
