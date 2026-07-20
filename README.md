@@ -97,15 +97,38 @@ old tags are unaffected; only `main` was rebuilt.
    stay near target_window; ramp below target still grows). Proposed for
    upstream.
 6. **Datagram send-queue AQM** (`TransportConfig::datagram_send_aqm`,
-   CoDel/RFC 8289): the outgoing datagram buffer is a deep FIFO; on a path
-   slower than the offered load it holds seconds of standing queue before the
-   drop-oldest overflow fires. With the AQM (on by default: 15 ms target /
+   FQ-CoDel/RFC 8289+8290): the outgoing datagram buffer is a deep FIFO; on a
+   path slower than the offered load it holds seconds of standing queue before
+   the drop-oldest overflow fires. With the AQM (on by default: 15 ms target /
    100 ms interval), queue heads whose sojourn time keeps the queue above
    target for a full interval are head-dropped with the CoDel control law,
-   bounding queue latency at any link speed; drops are counted in the new
+   bounding queue latency at any link speed; drops are counted in
    `ConnectionStats::datagram_tx` (`dropped_aqm`, plus `dropped_overflow` for
-   the pre-existing silent overflow evictions). `send`/`write` now carry
-   `now: Instant` for sojourn timestamping.
+   the pre-existing silent overflow evictions). `send`/`write` carry
+   `now: Instant` for sojourn timestamping. Since fork.11 the queue is
+   FQ-CoDel-shaped: the caller classifies each datagram
+   (`Connection::send_datagram_classified` with a `DatagramClass` holding an
+   inner-packet flow key + ECN codepoint, computed pre-encryption via
+   `DatagramClass::of_inner_ip_packet`); flows spread over per-flow queues
+   (`DatagramAqmConfig::flow_queues`, default 1024, `1` = the plain
+   single-queue CoDel), scheduled DRR with new-flow priority and a
+   12-datagram packet-train quantum (a per-packet round-robin shreds GSO/GRO
+   batching: 13-20% clean-path cost measured), each flow running its own
+   CoDel, and overflow evicting from the fattest flow. A bulk flow's standing
+   queue can no longer starve or delay a sparse flow multiplexed on the same
+   connection.
+7. **BDP-adaptive datagram send buffer**
+   (`TransportConfig::datagram_send_buffer_bdp`, on by default): the fixed
+   `datagram_send_buffer_size` is a worst-case constant, 1-2 orders of
+   magnitude above a slow last mile's real BDP; the adaptation shrinks the
+   effective limit to `clamp(4 x EWMA(bw x min_rtt), 1 MiB, configured)`
+   using a new `congestion::Controller::bdp_estimate` hook (implemented by
+   BBR; loss-based controllers keep the fixed size). Bench: queue capped at
+   ~1 MiB instead of 16 MiB on a 40 Mbit last mile with no clean-path cost.
+8. **Inner-ECN distribution counters** (measurement only):
+   `ConnectionStats::datagram_tx.ecn_{not_ect,ect0,ect1,ce}` count the
+   caller-classified inner-packet ECN codepoints at enqueue, the data basis
+   for any future mark-instead-of-drop AQM decision.
 
 ## Patch files (portable form of the deltas)
 
@@ -137,9 +160,15 @@ the primary upgrade path is now a plain `git rebase`.
   plus its regression tests and the `pub(crate)` widening of
   `RttEstimator::new` they need. Applies clean on `a96949f6`; the same
   one-token bug is present on upstream main.
-- `fork-datagram-aqm.patch`: the CoDel datagram-queue AQM (delta 6): config,
-  queue timestamping, dequeue-time controller, drop stats, and the
-  `now`-carrying `send`/`write` signatures with their call-site updates.
+- `fork-datagram-aqm.patch`: the CoDel datagram-queue AQM (delta 6 as of
+  fork.10): config, queue timestamping, dequeue-time controller, drop stats,
+  and the `now`-carrying `send`/`write` signatures with their call-site
+  updates.
+- `fork-datagram-fqcodel-bdp.patch`: the fork.11 queueing set on top of it
+  (deltas 6-8 final form): FQ-CoDel per-flow queues + DRR, the
+  `DatagramClass` classification API, the BDP-adaptive send buffer with the
+  `Controller::bdp_estimate` hook, and the inner-ECN counters. Applies on the
+  `v0.11.16-fork.10` tag content.
 
 The `fork-` prefix marks deltas that stay fork-local per `UPSTREAM-PR.md`;
 the `upstream-` patches are intended for submission.

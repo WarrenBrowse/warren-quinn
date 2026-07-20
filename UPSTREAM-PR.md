@@ -1,10 +1,11 @@
 # Upstream PR plan: Initial-packet fragmentation + padding control
 
-This fork carries six deltas vs upstream quinn. Two are proposed for
+This fork carries eight deltas vs upstream quinn. Two are proposed for
 upstream: the **two Initial-fragmentation knobs** (this document) and the
 **BBR STARTUP cwnd bound fix** (below). The GSO constants, socket-buffer
-sizing, Apple fast-datapath port and datagram-queue AQM are deployment
-tuning and stay fork-local.
+sizing, Apple fast-datapath port, the datagram-queue FQ-CoDel AQM, the
+BDP-adaptive send buffer and the inner-ECN counters are deployment tuning
+and stay fork-local.
 
 ## Second upstream candidate: BBR STARTUP cwnd bound fix
 
