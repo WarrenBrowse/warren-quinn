@@ -6,7 +6,7 @@ use thiserror::Error;
 use tracing::{debug, trace};
 
 use super::Connection;
-use crate::config::DatagramAqmConfig;
+use crate::config::{DatagramAqmConfig, DatagramBdpBufferConfig};
 use crate::connection::stats::DatagramTxStats;
 use crate::{
     Duration, Instant, TransportError,
@@ -149,8 +149,9 @@ impl Datagrams<'_> {
         if data.len() > max {
             return Err(SendDatagramError::TooLarge);
         }
+        let limit = self.effective_send_buffer_size();
         if drop {
-            while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
+            while self.conn.datagrams.outgoing_total > limit {
                 let len = self
                     .conn
                     .datagrams
@@ -159,9 +160,7 @@ impl Datagrams<'_> {
                 trace!(len, "dropping outgoing datagram");
                 self.conn.stats.datagram_tx.dropped_overflow += 1;
             }
-        } else if self.conn.datagrams.outgoing_total + data.len()
-            > self.conn.config.datagram_send_buffer_size
-        {
+        } else if self.conn.datagrams.outgoing_total + data.len() > limit {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
@@ -212,11 +211,43 @@ impl Datagrams<'_> {
     /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
     /// guaranteed not to cause older datagrams to be dropped.
     pub fn send_buffer_space(&self) -> usize {
-        self.conn
-            .config
-            .datagram_send_buffer_size
-            .saturating_sub(self.conn.datagrams.outgoing_total)
+        let limit = match (
+            &self.conn.config.datagram_send_buffer_bdp,
+            self.conn.datagrams.bdp_ewma,
+        ) {
+            (Some(config), Some(bdp)) => {
+                adaptive_send_buffer_limit(self.conn.config.datagram_send_buffer_size, config, bdp)
+            }
+            _ => self.conn.config.datagram_send_buffer_size,
+        };
+        limit.saturating_sub(self.conn.datagrams.outgoing_total)
     }
+
+    /// Effective send-buffer byte limit for this enqueue: the fixed
+    /// configured size, shrunk toward the path's measured BDP when adaptive
+    /// sizing is on and the congestion controller has an estimate
+    fn effective_send_buffer_size(&mut self) -> usize {
+        let configured = self.conn.config.datagram_send_buffer_size;
+        let Some(config) = &self.conn.config.datagram_send_buffer_bdp else {
+            return configured;
+        };
+        let Some(sample) = self.conn.path.congestion.bdp_estimate() else {
+            return configured;
+        };
+        let bdp = self.conn.datagrams.update_bdp_ewma(sample);
+        adaptive_send_buffer_limit(configured, config, bdp)
+    }
+}
+
+/// `clamp(multiple x bdp, floor, configured)`, with the configured cap
+/// winning over a larger floor (adaptation may only ever SHRINK the buffer)
+fn adaptive_send_buffer_limit(
+    configured: usize,
+    config: &DatagramBdpBufferConfig,
+    bdp: u64,
+) -> usize {
+    let target = (bdp as f64 * config.multiple) as usize;
+    target.clamp(config.floor.min(configured), configured)
 }
 
 /// An outgoing datagram together with the time it entered the send buffer
@@ -384,9 +415,25 @@ pub(super) struct DatagramState {
     new_flows: VecDeque<u32>,
     /// Flows being served round-robin
     old_flows: VecDeque<u32>,
+    /// Smoothed BDP estimate driving adaptive send-buffer sizing
+    bdp_ewma: Option<u64>,
 }
 
 impl DatagramState {
+    /// Fold a fresh BDP sample into the smoothed estimate (EWMA, alpha 1/8)
+    /// and return it
+    ///
+    /// The controller's bandwidth/rtt filters are already windowed, so this
+    /// only damps filter-rotation steps; per-enqueue updates converge within
+    /// a few packets of any sustained change.
+    pub(super) fn update_bdp_ewma(&mut self, sample: u64) -> u64 {
+        let next = match self.bdp_ewma {
+            None => sample,
+            Some(prev) => (prev as i128 + (sample as i128 - prev as i128) / 8) as u64,
+        };
+        self.bdp_ewma = Some(next);
+        next
+    }
     /// Queue a datagram on its flow bucket, registering a fresh bucket with
     /// the DRR scheduler
     pub(super) fn enqueue(&mut self, bucket: u32, datagram: QueuedDatagram) {
@@ -1079,6 +1126,65 @@ mod tests {
         state.drop_oversized(1000);
         assert_eq!(state.outgoing_total, 200);
         assert_eq!(state.outgoing_total, recount(&state));
+    }
+
+    #[test]
+    fn adaptive_limit_clamps_between_floor_and_configured() {
+        let config = DatagramBdpBufferConfig::default();
+        let configured = 16 * 1024 * 1024;
+        // Slow path: 4 x 62 KB BDP is below the 256 KiB floor.
+        assert_eq!(
+            adaptive_send_buffer_limit(configured, &config, 62_000),
+            256 * 1024
+        );
+        // Mid path: the multiple applies untouched.
+        assert_eq!(
+            adaptive_send_buffer_limit(configured, &config, 1_000_000),
+            4_000_000
+        );
+        // Fast path: never above the configured cap.
+        assert_eq!(
+            adaptive_send_buffer_limit(configured, &config, 100_000_000),
+            configured
+        );
+        // A configured cap below the floor wins: adaptation only shrinks.
+        assert_eq!(
+            adaptive_send_buffer_limit(64 * 1024, &config, 62_000),
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn adaptive_multiple_clamps_below_one() {
+        let mut config = DatagramBdpBufferConfig::default();
+        config.multiple(0.25);
+        // A sub-BDP buffer cannot keep the pipe full: 1x is the minimum.
+        assert_eq!(
+            adaptive_send_buffer_limit(16 * 1024 * 1024, &config, 1_000_000),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn bdp_ewma_seeds_then_converges() {
+        let mut state = DatagramState::default();
+        assert_eq!(state.update_bdp_ewma(80_000), 80_000, "first sample seeds");
+        // A sustained 8x drop must pull the estimate most of the way down
+        // within a few dozen samples (alpha 1/8).
+        let mut last = 0;
+        for _ in 0..32 {
+            last = state.update_bdp_ewma(10_000);
+        }
+        assert!(
+            last < 12_000,
+            "EWMA must converge toward the sustained sample, got {last}"
+        );
+        // And a single outlier barely moves it.
+        let after_spike = state.update_bdp_ewma(1_000_000);
+        assert!(
+            after_spike < 150_000,
+            "one outlier must not swing the estimate, got {after_spike}"
+        );
     }
 
     #[test]

@@ -65,6 +65,16 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Estimated bandwidth-delay product of the path in bytes, when the
+    /// controller measures one
+    ///
+    /// `None` when the controller does not model bandwidth (loss-based
+    /// controllers) or has no estimate yet. Used to adapt send-buffer sizing
+    /// to the real path instead of a worst-case constant.
+    fn bdp_estimate(&self) -> Option<u64> {
+        None
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
