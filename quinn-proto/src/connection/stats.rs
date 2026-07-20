@@ -170,6 +170,37 @@ pub struct DatagramTxStats {
     pub dropped_overflow: u64,
     /// Datagrams head-dropped by the CoDel AQM (queue sojourn above target)
     pub dropped_aqm: u64,
+    /// Datagrams accepted into the send buffer whose inner packet was Not-ECT
+    ///
+    /// The four `ecn_*` counters record the ECN codepoint distribution of the
+    /// caller-classified inner packets at enqueue time (see
+    /// `DatagramClass`). Datagrams enqueued without a classification (cover
+    /// traffic, non-IP payloads) are counted by none of them, so the four sum
+    /// to the classified subset, not to `FrameStats::datagram`.
+    pub ecn_not_ect: u64,
+    /// Datagrams accepted into the send buffer whose inner packet was ECT(0)
+    pub ecn_ect0: u64,
+    /// Datagrams accepted into the send buffer whose inner packet was ECT(1)
+    pub ecn_ect1: u64,
+    /// Datagrams accepted into the send buffer whose inner packet was CE
+    pub ecn_ce: u64,
+}
+
+impl DatagramTxStats {
+    /// Record the inner-packet ECN codepoint of a datagram accepted into the
+    /// send buffer. `None` (unclassified) is deliberately not counted: the
+    /// measurement is the distribution of real inner packets, and only the
+    /// caller can tell those apart from cover or control payloads.
+    pub(crate) fn record_ecn(&mut self, ecn: Option<crate::connection::datagrams::DatagramEcn>) {
+        use crate::connection::datagrams::DatagramEcn;
+        match ecn {
+            None => {}
+            Some(DatagramEcn::NotEct) => self.ecn_not_ect += 1,
+            Some(DatagramEcn::Ect0) => self.ecn_ect0 += 1,
+            Some(DatagramEcn::Ect1) => self.ecn_ect1 += 1,
+            Some(DatagramEcn::Ce) => self.ecn_ce += 1,
+        }
+    }
 }
 
 /// Connection statistics
