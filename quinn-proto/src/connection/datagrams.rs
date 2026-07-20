@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
+use rustc_hash::FxHashMap;
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -150,14 +151,12 @@ impl Datagrams<'_> {
         }
         if drop {
             while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
-                let prev = self
+                let len = self
                     .conn
                     .datagrams
-                    .outgoing
-                    .pop_front()
+                    .evict_from_fattest_flow()
                     .expect("datagrams.outgoing_total desynchronized");
-                trace!(len = prev.datagram.data.len(), "dropping outgoing datagram");
-                self.conn.datagrams.outgoing_total -= prev.datagram.data.len();
+                trace!(len, "dropping outgoing datagram");
                 self.conn.stats.datagram_tx.dropped_overflow += 1;
             }
         } else if self.conn.datagrams.outgoing_total + data.len()
@@ -167,11 +166,14 @@ impl Datagrams<'_> {
             return Err(SendDatagramError::Blocked(data));
         }
         self.conn.stats.datagram_tx.record_ecn(class.ecn);
-        self.conn.datagrams.outgoing_total += data.len();
-        self.conn.datagrams.outgoing.push_back(QueuedDatagram {
-            queued_at: now,
-            datagram: Datagram { data },
-        });
+        let bucket = bucket_for(class.flow, self.conn.config.datagram_send_aqm.as_ref());
+        self.conn.datagrams.enqueue(
+            bucket,
+            QueuedDatagram {
+                queued_at: now,
+                datagram: Datagram { data },
+            },
+        );
         Ok(())
     }
 
@@ -313,19 +315,137 @@ impl CodelState {
     }
 }
 
+/// The catch-all bucket: unclassified datagrams, and every datagram when
+/// per-flow queueing is off (no AQM, or `flow_queues <= 1`).
+const SHARED_BUCKET: u32 = 0;
+
+/// DRR byte credit per scheduling round (RFC 8290 section 4.2 quantum)
+///
+/// Deliberately ~12 full-size datagrams rather than the classic one-MTU
+/// quantum: a per-packet round-robin shreds the per-flow packet trains that
+/// GSO batching and receiver-side GRO coalescing depend on, which measurably
+/// costs clean-path throughput at high rates (13-20% in the fork.11 A/B).
+/// Packet-train turns keep that batching; the sparse-flow latency cost is
+/// bounded by quantum/line_rate (3 ms at 40 Mbit, microseconds at 1 Gbps)
+/// and fresh sparse flows still preempt via the new-flow priority list.
+const FQ_QUANTUM: i64 = 15_000;
+
+/// Maps a caller-supplied flow key onto a queue bucket. Classified flows
+/// spread over `1..=flow_queues`; [`SHARED_BUCKET`] stays reserved so cover
+/// traffic and unclassifiable packets never collide with a hashed flow.
+fn bucket_for(flow: Option<u64>, aqm: Option<&DatagramAqmConfig>) -> u32 {
+    match (flow, aqm) {
+        (Some(f), Some(config)) if config.flow_queues > 1 => {
+            1 + (f % config.flow_queues as u64) as u32
+        }
+        _ => SHARED_BUCKET,
+    }
+}
+
+/// One flow's FIFO plus its scheduler and AQM state
+///
+/// Lives only while the flow has datagrams queued (or is finishing its DRR
+/// round): state is proportional to ACTIVE flows, not to the bucket space.
+struct FlowQueue {
+    queue: VecDeque<QueuedDatagram>,
+    /// Queued payload bytes (this queue's share of `outgoing_total`)
+    bytes: usize,
+    /// DRR byte credit; a flow only dequeues while positive
+    deficit: i64,
+    codel: CodelState,
+}
+
+impl FlowQueue {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            bytes: 0,
+            deficit: FQ_QUANTUM,
+            codel: CodelState::default(),
+        }
+    }
+}
+
+/// Which DRR list the scheduler is currently serving from
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowList {
+    New,
+    Old,
+}
+
 #[derive(Default)]
 pub(super) struct DatagramState {
     /// Number of bytes of datagrams that have been received by the local transport but not
     /// delivered to the application
     pub(super) recv_buffered: usize,
     pub(super) incoming: VecDeque<Datagram>,
-    pub(super) outgoing: VecDeque<QueuedDatagram>,
     pub(super) outgoing_total: usize,
     pub(super) send_blocked: bool,
-    codel: CodelState,
+    /// Active flow queues by bucket. With classification off this holds at
+    /// most [`SHARED_BUCKET`], which reduces to the historic single FIFO.
+    flows: FxHashMap<u32, FlowQueue>,
+    /// Flows that became active since last served: they get scheduling
+    /// priority (RFC 8290), which is what shields a sparse flow from a
+    /// standing bulk queue.
+    new_flows: VecDeque<u32>,
+    /// Flows being served round-robin
+    old_flows: VecDeque<u32>,
 }
 
 impl DatagramState {
+    /// Queue a datagram on its flow bucket, registering a fresh bucket with
+    /// the DRR scheduler
+    pub(super) fn enqueue(&mut self, bucket: u32, datagram: QueuedDatagram) {
+        self.outgoing_total += datagram.datagram.data.len();
+        match self.flows.get_mut(&bucket) {
+            Some(flow) => {
+                flow.bytes += datagram.datagram.data.len();
+                flow.queue.push_back(datagram);
+            }
+            None => {
+                let mut flow = FlowQueue::new();
+                flow.bytes = datagram.datagram.data.len();
+                flow.queue.push_back(datagram);
+                self.flows.insert(bucket, flow);
+                self.new_flows.push_back(bucket);
+            }
+        }
+    }
+
+    /// Drop the head of the flow with the largest backlog (RFC 8290's
+    /// overlimit behavior), returning its payload length
+    ///
+    /// With a single active flow this is exactly the historic oldest-first
+    /// eviction; with several it protects sparse flows from a flooder that
+    /// overruns the shared buffer.
+    pub(super) fn evict_from_fattest_flow(&mut self) -> Option<usize> {
+        let bucket = self
+            .flows
+            .iter()
+            .filter(|(_, q)| !q.queue.is_empty())
+            .max_by_key(|(_, q)| q.bytes)
+            .map(|(&b, _)| b)?;
+        let flow = self.flows.get_mut(&bucket)?;
+        let prev = flow.queue.pop_front()?;
+        let len = prev.datagram.data.len();
+        flow.bytes -= len;
+        self.outgoing_total -= len;
+        Some(len)
+    }
+
+    /// Whether no outgoing datagram is queued on any flow
+    pub(super) fn is_empty(&self) -> bool {
+        self.flows.values().all(|q| q.queue.is_empty())
+    }
+
+    /// Whether some queued datagram's frame would fit in `max_size` bytes
+    pub(super) fn can_write(&self, max_size: usize) -> bool {
+        self.flows.values().any(|q| {
+            q.queue
+                .front()
+                .is_some_and(|d| d.frame_size(true) <= max_size)
+        })
+    }
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
@@ -361,28 +481,34 @@ impl DatagramState {
     /// queued but can't send it.
     pub(super) fn drop_oversized(&mut self, max_payload: usize) {
         let outgoing_total = &mut self.outgoing_total;
-        self.outgoing.retain(|queued| {
-            let result = queued.datagram.data.len() < max_payload;
-            if !result {
-                trace!(
-                    "dropping {} byte datagram violating {} byte limit",
-                    queued.datagram.data.len(),
-                    max_payload
-                );
-                *outgoing_total -= queued.datagram.data.len();
-            }
-            result
-        });
+        for flow in self.flows.values_mut() {
+            let bytes = &mut flow.bytes;
+            flow.queue.retain(|queued| {
+                let result = queued.datagram.data.len() < max_payload;
+                if !result {
+                    trace!(
+                        "dropping {} byte datagram violating {} byte limit",
+                        queued.datagram.data.len(),
+                        max_payload
+                    );
+                    *outgoing_total -= queued.datagram.data.len();
+                    *bytes -= queued.datagram.data.len();
+                }
+                result
+            });
+        }
     }
 
-    /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
+    /// Attempt to write a datagram frame into `buf`, consuming it from the flow queues
     ///
     /// Returns whether a frame was written. At most `max_size` bytes will be written, including
     /// framing.
     ///
-    /// When `aqm` is configured, queue heads whose sojourn time keeps the
-    /// queue above the latency target are dropped (and counted in `stats`)
-    /// instead of transmitted, oldest first, per the CoDel control law.
+    /// Flows are served DRR round-robin with new-flow priority (RFC 8290);
+    /// when `aqm` is configured, each flow runs its own CoDel: heads whose
+    /// sojourn time keeps the queue above the latency target are dropped
+    /// (and counted in `stats`) instead of transmitted. A drained flow is
+    /// unregistered, so an idle connection carries no per-flow state.
     pub(super) fn write(
         &mut self,
         buf: &mut Vec<u8>,
@@ -392,19 +518,51 @@ impl DatagramState {
         stats: &mut DatagramTxStats,
     ) -> bool {
         loop {
-            let queued = match self.outgoing.pop_front() {
+            let (list, bucket) = match (self.new_flows.front(), self.old_flows.front()) {
+                (Some(&b), _) => (FlowList::New, b),
+                (None, Some(&b)) => (FlowList::Old, b),
+                (None, None) => return false,
+            };
+            let flow = self
+                .flows
+                .get_mut(&bucket)
+                .expect("scheduled flow bucket must exist");
+
+            if flow.deficit <= 0 {
+                // Out of credit: refill and move to the back of the old
+                // list; some other flow gets this turn.
+                flow.deficit += FQ_QUANTUM;
+                match list {
+                    FlowList::New => self.new_flows.pop_front(),
+                    FlowList::Old => self.old_flows.pop_front(),
+                };
+                self.old_flows.push_back(bucket);
+                continue;
+            }
+
+            let queued = match flow.queue.pop_front() {
                 Some(x) => x,
                 None => {
-                    // An empty queue is by definition below target.
-                    self.codel.first_above_time = None;
-                    self.codel.dropping = false;
-                    return false;
+                    // Drained flow: a new-list flow gets one final round on
+                    // the old list (RFC 8290: prevents cycling through the
+                    // priority list), an old-list flow is unregistered.
+                    match list {
+                        FlowList::New => {
+                            self.new_flows.pop_front();
+                            self.old_flows.push_back(bucket);
+                        }
+                        FlowList::Old => {
+                            self.old_flows.pop_front();
+                            self.flows.remove(&bucket);
+                        }
+                    }
+                    continue;
                 }
             };
 
             if let Some(config) = aqm {
                 let sojourn = now.saturating_duration_since(queued.queued_at);
-                if self
+                if flow
                     .codel
                     .should_drop(sojourn, self.outgoing_total, now, config)
                 {
@@ -414,25 +572,26 @@ impl DatagramState {
                         "AQM dropping outgoing datagram"
                     );
                     self.outgoing_total -= queued.datagram.data.len();
+                    flow.bytes -= queued.datagram.data.len();
                     stats.dropped_aqm += 1;
                     continue;
                 }
             }
 
-            let datagram = queued.datagram;
-            if buf.len() + datagram.size(true) > max_size {
+            let size = queued.frame_size(true);
+            if buf.len() + size > max_size {
                 // Future work: we could be more clever about cramming small datagrams into
                 // mostly-full packets when a larger one is queued first
-                self.outgoing.push_front(QueuedDatagram {
-                    queued_at: queued.queued_at,
-                    datagram,
-                });
+                flow.queue.push_front(queued);
                 return false;
             }
 
+            let datagram = queued.datagram;
             trace!(len = datagram.data.len(), "DATAGRAM");
 
             self.outgoing_total -= datagram.data.len();
+            flow.bytes -= datagram.data.len();
+            flow.deficit -= size as i64;
             datagram.encode(true, buf);
             return true;
         }
@@ -538,6 +697,29 @@ mod tests {
         }
     }
 
+    /// Enqueue a `len`-byte payload whose bytes tag its flow, on `bucket`,
+    /// at `queued_at`.
+    fn push(state: &mut DatagramState, bucket: u32, tag: u8, len: usize, queued_at: Instant) {
+        let data = Bytes::from(vec![tag; len]);
+        state.enqueue(
+            bucket,
+            QueuedDatagram {
+                queued_at,
+                datagram: Datagram { data },
+            },
+        );
+    }
+
+    /// Total bytes queued across every flow, recomputed from scratch.
+    fn recount(state: &DatagramState) -> usize {
+        state
+            .flows
+            .values()
+            .flat_map(|q| q.queue.iter())
+            .map(|d| d.datagram.data.len())
+            .sum()
+    }
+
     #[test]
     fn write_head_drops_stale_datagrams_and_counts_them() {
         let mut state = DatagramState::default();
@@ -546,15 +728,8 @@ mod tests {
         let start = Instant::now();
         // A queue whose head has been waiting far beyond target for well over
         // an interval, deep enough to stay above the backlog floor.
-        let payload = Bytes::from_static(&[0u8; 1000]);
         for _ in 0..64 {
-            state.outgoing.push_back(QueuedDatagram {
-                queued_at: start,
-                datagram: Datagram {
-                    data: payload.clone(),
-                },
-            });
-            state.outgoing_total += payload.len();
+            push(&mut state, SHARED_BUCKET, 0, 1000, start);
         }
         let now = start + Duration::from_millis(500);
         // Prime the controller past first_above_time, as a live queue would
@@ -568,9 +743,9 @@ mod tests {
             stats.dropped_aqm > 0,
             "stale heads must be AQM-dropped before delivery"
         );
-        let queued_bytes: usize = state.outgoing.iter().map(|d| d.datagram.data.len()).sum();
         assert_eq!(
-            state.outgoing_total, queued_bytes,
+            state.outgoing_total,
+            recount(&state),
             "outgoing_total must stay in sync through AQM drops"
         );
     }
@@ -713,15 +888,8 @@ mod tests {
         let mut state = DatagramState::default();
         let mut stats = DatagramTxStats::default();
         let start = Instant::now();
-        let payload = Bytes::from_static(&[0u8; 1000]);
         for _ in 0..64 {
-            state.outgoing.push_back(QueuedDatagram {
-                queued_at: start,
-                datagram: Datagram {
-                    data: payload.clone(),
-                },
-            });
-            state.outgoing_total += payload.len();
+            push(&mut state, SHARED_BUCKET, 0, 1000, start);
         }
         let now = start + Duration::from_secs(10);
         let mut delivered = 0;
@@ -731,6 +899,209 @@ mod tests {
         }
         assert_eq!(delivered, 64);
         assert_eq!(stats.dropped_aqm, 0);
+    }
+
+    #[test]
+    fn single_bucket_preserves_fifo_order() {
+        // The single-queue fallback (flow_queues = 1, or unclassified
+        // traffic) must deliver in exact enqueue order: the DRR machinery
+        // degenerates to the historic FIFO.
+        let mut state = DatagramState::default();
+        let mut stats = DatagramTxStats::default();
+        let now = Instant::now();
+        for tag in 0..32u8 {
+            push(&mut state, SHARED_BUCKET, tag, 1000, now);
+        }
+        let mut order = Vec::new();
+        loop {
+            let mut buf = Vec::new();
+            if !state.write(&mut buf, usize::MAX, now, Some(&aqm()), &mut stats) {
+                break;
+            }
+            // The payload sits at the end of the encoded frame; every one of
+            // its bytes is the tag.
+            order.push(*buf.last().unwrap());
+        }
+        assert_eq!(order, (0..32u8).collect::<Vec<_>>());
+        assert_eq!(stats.dropped_aqm, 0, "a fresh queue must not drop");
+        assert!(state.is_empty());
+        assert_eq!(state.outgoing_total, 0);
+    }
+
+    #[test]
+    fn bucket_for_reserves_the_shared_bucket() {
+        let config = aqm();
+        // Classified flows never land on the shared bucket, whatever the key.
+        for f in 0..2048u64 {
+            assert_ne!(bucket_for(Some(f), Some(&config)), SHARED_BUCKET);
+        }
+        // Unclassified always does, as does everything without AQM or with
+        // per-flow queueing collapsed to one queue.
+        assert_eq!(bucket_for(None, Some(&config)), SHARED_BUCKET);
+        assert_eq!(bucket_for(Some(42), None), SHARED_BUCKET);
+        let mut single = aqm();
+        single.flow_queues(1);
+        assert_eq!(bucket_for(Some(42), Some(&single)), SHARED_BUCKET);
+        let mut zero = aqm();
+        zero.flow_queues(0);
+        assert_eq!(
+            bucket_for(Some(42), Some(&zero)),
+            SHARED_BUCKET,
+            "flow_queues(0) must clamp to the single-queue fallback"
+        );
+    }
+
+    #[test]
+    fn sparse_flow_is_not_starved_or_dropped_by_a_flooding_flow() {
+        // A bulk flow with a standing queue deep in CoDel's dropping state
+        // and a sparse flow with one fresh packet: the sparse packet must go
+        // out promptly (new-flow priority) and must never be CoDel-dropped
+        // (its own sojourn is below target even though the bulk queue is way
+        // above).
+        let mut state = DatagramState::default();
+        let config = aqm();
+        let mut stats = DatagramTxStats::default();
+        let start = Instant::now();
+        for _ in 0..512 {
+            push(&mut state, 1, 0xbb, 1200, start);
+        }
+        // Serve the bulk queue with time advancing so its CoDel walks
+        // through first_above_time into the dropping state, and past its
+        // FIRST DRR quantum so it has rotated onto the old-flows list (a
+        // flow only holds new-list priority for one quantum after birth).
+        let mut now = start + Duration::from_millis(400);
+        for _ in 0..16 {
+            let mut buf = Vec::new();
+            state.write(&mut buf, usize::MAX, now, Some(&config), &mut stats);
+            now += Duration::from_millis(50);
+        }
+        assert!(
+            stats.dropped_aqm > 0,
+            "bulk standing queue must be dropping"
+        );
+
+        // The sparse flow arrives now, on its own bucket.
+        let later = now + Duration::from_millis(10);
+        push(&mut state, 2, 0x55, 100, later);
+        let dropped_before = stats.dropped_aqm;
+        let mut buf = Vec::new();
+        assert!(state.write(&mut buf, usize::MAX, later, Some(&config), &mut stats));
+        assert_eq!(
+            *buf.last().unwrap(),
+            0x55,
+            "the fresh sparse packet must be scheduled before the bulk backlog"
+        );
+        assert_eq!(
+            stats.dropped_aqm, dropped_before,
+            "serving the sparse flow must not drop anything"
+        );
+        assert_eq!(state.outgoing_total, recount(&state));
+    }
+
+    #[test]
+    fn drr_shares_bandwidth_between_two_bulk_flows() {
+        // Two backlogged flows with very different packet sizes: the DRR
+        // quantum must interleave service byte-fairly instead of draining
+        // one flow before touching the other.
+        let mut state = DatagramState::default();
+        let mut stats = DatagramTxStats::default();
+        let now = Instant::now();
+        for _ in 0..64 {
+            push(&mut state, 1, 0xaa, 1200, now);
+        }
+        for _ in 0..192 {
+            push(&mut state, 2, 0xcc, 400, now);
+        }
+        let (mut a_bytes, mut c_bytes) = (0usize, 0usize);
+        let mut both_served_at_quarter = false;
+        let mut served = 0;
+        loop {
+            let mut buf = Vec::new();
+            if !state.write(&mut buf, usize::MAX, now, None, &mut stats) {
+                break;
+            }
+            served += 1;
+            match *buf.last().unwrap() {
+                0xaa => a_bytes += 1200,
+                0xcc => c_bytes += 400,
+                other => panic!("unexpected tag {other}"),
+            }
+            if served == 64 {
+                both_served_at_quarter = a_bytes.min(c_bytes) > 0;
+            }
+        }
+        assert_eq!(a_bytes, 64 * 1200);
+        assert_eq!(c_bytes, 192 * 400);
+        assert!(
+            both_served_at_quarter,
+            "DRR must interleave flows, not drain them serially"
+        );
+    }
+
+    #[test]
+    fn overflow_eviction_hits_the_fattest_flow() {
+        let mut state = DatagramState::default();
+        let now = Instant::now();
+        push(&mut state, 1, 0xbb, 1200, now);
+        push(&mut state, 1, 0xbb, 1200, now);
+        push(&mut state, 2, 0x55, 100, now);
+        let evicted = state.evict_from_fattest_flow().unwrap();
+        assert_eq!(evicted, 1200, "the bulk flow must pay for the overflow");
+        assert_eq!(state.outgoing_total, recount(&state));
+        // Draining continues from the fattest until nothing is left.
+        assert_eq!(state.evict_from_fattest_flow(), Some(1200));
+        assert_eq!(state.evict_from_fattest_flow(), Some(100));
+        assert_eq!(state.evict_from_fattest_flow(), None);
+        assert_eq!(state.outgoing_total, 0);
+    }
+
+    #[test]
+    fn drained_flows_are_unregistered() {
+        // Per-flow state must not accumulate: after a drain the flow map is
+        // empty again (the write scheduler removes exhausted flows).
+        let mut state = DatagramState::default();
+        let mut stats = DatagramTxStats::default();
+        let now = Instant::now();
+        for bucket in 1..=16u32 {
+            push(&mut state, bucket, bucket as u8, 500, now);
+        }
+        let mut buf = Vec::new();
+        while state.write(&mut buf, usize::MAX, now, Some(&aqm()), &mut stats) {
+            buf.clear();
+        }
+        assert!(state.is_empty());
+        assert!(
+            state.flows.is_empty(),
+            "drained flow queues must be removed, not leak per-flow state"
+        );
+        assert!(state.new_flows.is_empty() && state.old_flows.is_empty());
+    }
+
+    #[test]
+    fn drop_oversized_prunes_every_flow() {
+        let mut state = DatagramState::default();
+        let now = Instant::now();
+        push(&mut state, 1, 0xaa, 1400, now);
+        push(&mut state, 1, 0xaa, 200, now);
+        push(&mut state, 2, 0xcc, 1400, now);
+        state.drop_oversized(1000);
+        assert_eq!(state.outgoing_total, 200);
+        assert_eq!(state.outgoing_total, recount(&state));
+    }
+
+    #[test]
+    fn can_write_and_is_empty_see_every_flow() {
+        let mut state = DatagramState::default();
+        assert!(state.is_empty());
+        assert!(!state.can_write(usize::MAX));
+        let now = Instant::now();
+        push(&mut state, 7, 0xaa, 1000, now);
+        assert!(!state.is_empty());
+        assert!(state.can_write(usize::MAX));
+        assert!(
+            !state.can_write(8),
+            "a head that cannot fit must not report writability"
+        );
     }
 }
 

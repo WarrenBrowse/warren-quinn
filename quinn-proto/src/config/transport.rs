@@ -827,13 +827,14 @@ impl Default for MtuDiscoveryConfig {
     }
 }
 
-/// Parameters for the outgoing-datagram queue AQM (CoDel, RFC 8289)
+/// Parameters for the outgoing-datagram queue AQM (FQ-CoDel, RFC 8289/8290)
 ///
 /// See [`TransportConfig::datagram_send_aqm`].
 #[derive(Debug, Copy, Clone)]
 pub struct DatagramAqmConfig {
     pub(crate) target: Duration,
     pub(crate) interval: Duration,
+    pub(crate) flow_queues: usize,
 }
 
 impl DatagramAqmConfig {
@@ -856,6 +857,20 @@ impl DatagramAqmConfig {
         self.interval = value;
         self
     }
+
+    /// Number of hash buckets caller-classified flows are spread across for
+    /// per-flow queueing (RFC 8290 shape: DRR scheduling across flows, CoDel
+    /// per flow).
+    ///
+    /// Defaults to 1024 (the fq_codel default; state is per ACTIVE flow, so
+    /// the bucket count costs no memory). `1` collapses to a single shared
+    /// queue, byte-identical to plain CoDel; `0` is clamped to `1`.
+    /// Datagrams enqueued without a flow key share one catch-all bucket
+    /// regardless of this setting.
+    pub fn flow_queues(&mut self, value: usize) -> &mut Self {
+        self.flow_queues = value.max(1);
+        self
+    }
 }
 
 impl Default for DatagramAqmConfig {
@@ -863,6 +878,7 @@ impl Default for DatagramAqmConfig {
         Self {
             target: Duration::from_millis(15),
             interval: Duration::from_millis(100),
+            flow_queues: 1024,
         }
     }
 }
