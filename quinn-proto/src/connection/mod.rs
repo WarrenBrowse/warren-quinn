@@ -901,7 +901,7 @@ impl Connection {
                     && !can_send.acks
                     && can_send.other
                     && (buf_capacity - builder.datagram_start) == self.path.current_mtu() as usize
-                    && self.datagrams.outgoing.is_empty()),
+                    && self.datagrams.is_empty()),
                 "SendableFrames was {can_send:?}, but only ACKs have been written"
             );
             pad_datagram |= sent.requires_padding;
@@ -3745,11 +3745,7 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|(_, x)| x.challenge_pending)
             || !self.path_responses.is_empty()
-            || self
-                .datagrams
-                .outgoing
-                .front()
-                .is_some_and(|x| x.frame_size(true) <= max_size)
+            || self.datagrams.can_write(max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
