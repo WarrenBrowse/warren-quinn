@@ -937,7 +937,10 @@ impl DatagramBdpBufferConfig {
     ///
     /// Guards ramp-up (the first bandwidth samples undershoot) and very
     /// low-latency paths whose BDP is tiny while their throughput is not.
-    /// Defaults to 256 KiB. If the configured
+    /// Defaults to 1 MiB: transitions between path phases (the bandwidth
+    /// filters lag a sudden rate jump) burst past a tighter floor and cost
+    /// clean-path throughput, while 1 MiB still bounds a slow path 16x below
+    /// the historic 16 MiB worst case. If the configured
     /// [`TransportConfig::datagram_send_buffer_size`] is smaller than the
     /// floor, the configured size wins (the floor never grows the buffer).
     pub fn floor(&mut self, value: usize) -> &mut Self {
@@ -950,7 +953,7 @@ impl Default for DatagramBdpBufferConfig {
     fn default() -> Self {
         Self {
             multiple: 4.0,
-            floor: 256 * 1024,
+            floor: 1024 * 1024,
         }
     }
 }

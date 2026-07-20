@@ -1140,10 +1140,10 @@ mod tests {
     fn adaptive_limit_clamps_between_floor_and_configured() {
         let config = DatagramBdpBufferConfig::default();
         let configured = 16 * 1024 * 1024;
-        // Slow path: 4 x 62 KB BDP is below the 256 KiB floor.
+        // Slow path: 4 x 62 KB BDP is below the 1 MiB floor.
         assert_eq!(
             adaptive_send_buffer_limit(configured, &config, 62_000),
-            256 * 1024
+            1024 * 1024
         );
         // Mid path: the multiple applies untouched.
         assert_eq!(
@@ -1168,8 +1168,8 @@ mod tests {
         config.multiple(0.25);
         // A sub-BDP buffer cannot keep the pipe full: 1x is the minimum.
         assert_eq!(
-            adaptive_send_buffer_limit(16 * 1024 * 1024, &config, 1_000_000),
-            1_000_000
+            adaptive_send_buffer_limit(16 * 1024 * 1024, &config, 2_000_000),
+            2_000_000
         );
     }
 
