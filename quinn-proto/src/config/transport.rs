@@ -55,6 +55,7 @@ pub struct TransportConfig {
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
     pub(crate) datagram_send_aqm: Option<DatagramAqmConfig>,
+    pub(crate) datagram_send_buffer_bdp: Option<DatagramBdpBufferConfig>,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -359,12 +360,38 @@ impl TransportConfig {
     /// queue latency at any link speed and gives loss-responsive inner
     /// traffic (e.g. tunnelled TCP) its congestion signal within one RTT
     /// instead of after a timeout. Transient bursts shorter than `interval`
-    /// are never dropped.
+    /// are never dropped. Caller-classified datagrams are additionally
+    /// spread across per-flow queues (RFC 8290 shape, see
+    /// [`DatagramAqmConfig::flow_queues`]) so a bulk flow's standing queue
+    /// cannot starve or delay a sparse flow multiplexed on the same
+    /// connection.
     ///
     /// `None` disables the AQM: the buffer then only drops oldest-first on
     /// overflow. Defaults to enabled with [`DatagramAqmConfig::default`].
     pub fn datagram_send_aqm(&mut self, value: Option<DatagramAqmConfig>) -> &mut Self {
         self.datagram_send_aqm = value;
+        self
+    }
+
+    /// BDP-adaptive sizing of the outgoing datagram send buffer
+    ///
+    /// [`Self::datagram_send_buffer_size`] is a fixed worst-case constant; on
+    /// a path whose real bandwidth-delay product is orders of magnitude
+    /// smaller, a buffer that big is pure queueing latency headroom
+    /// (bufferbloat). When this is configured and the congestion controller
+    /// measures a BDP (BBR), the effective buffer limit becomes
+    /// `clamp(multiple x smoothed BDP, floor, datagram_send_buffer_size)`:
+    /// it tracks the path, never exceeds the configured cap, and never
+    /// shrinks below `floor`. Controllers without a bandwidth model (CUBIC,
+    /// NewReno) keep the fixed size.
+    ///
+    /// `None` disables the adaptation. Defaults to enabled with
+    /// [`DatagramBdpBufferConfig::default`].
+    pub fn datagram_send_buffer_bdp(
+        &mut self,
+        value: Option<DatagramBdpBufferConfig>,
+    ) -> &mut Self {
+        self.datagram_send_buffer_bdp = value;
         self
     }
 
@@ -458,6 +485,7 @@ impl Default for TransportConfig {
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
             datagram_send_aqm: Some(DatagramAqmConfig::default()),
+            datagram_send_buffer_bdp: Some(DatagramBdpBufferConfig::default()),
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -497,6 +525,7 @@ impl fmt::Debug for TransportConfig {
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
             datagram_send_aqm,
+            datagram_send_buffer_bdp,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -535,6 +564,7 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             .field("datagram_send_aqm", datagram_send_aqm)
+            .field("datagram_send_buffer_bdp", datagram_send_buffer_bdp)
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload);
         if cfg!(feature = "qlog") {
@@ -879,6 +909,51 @@ impl Default for DatagramAqmConfig {
             target: Duration::from_millis(15),
             interval: Duration::from_millis(100),
             flow_queues: 1024,
+        }
+    }
+}
+
+/// Parameters for BDP-adaptive datagram send-buffer sizing
+///
+/// See [`TransportConfig::datagram_send_buffer_bdp`].
+#[derive(Debug, Copy, Clone)]
+pub struct DatagramBdpBufferConfig {
+    pub(crate) multiple: f64,
+    pub(crate) floor: usize,
+}
+
+impl DatagramBdpBufferConfig {
+    /// Buffer size as a multiple of the smoothed BDP estimate.
+    ///
+    /// Defaults to 4: enough headroom for BBR's probing gain and transient
+    /// bursts without re-creating a deep standing queue. Values below 1 are
+    /// clamped to 1 (a sub-BDP buffer cannot keep the pipe full).
+    pub fn multiple(&mut self, value: f64) -> &mut Self {
+        self.multiple = if value < 1.0 { 1.0 } else { value };
+        self
+    }
+
+    /// Lower bound of the adaptive buffer in bytes.
+    ///
+    /// Guards ramp-up (the first bandwidth samples undershoot) and very
+    /// low-latency paths whose BDP is tiny while their throughput is not.
+    /// Defaults to 1 MiB: transitions between path phases (the bandwidth
+    /// filters lag a sudden rate jump) burst past a tighter floor and cost
+    /// clean-path throughput, while 1 MiB still bounds a slow path 16x below
+    /// the historic 16 MiB worst case. If the configured
+    /// [`TransportConfig::datagram_send_buffer_size`] is smaller than the
+    /// floor, the configured size wins (the floor never grows the buffer).
+    pub fn floor(&mut self, value: usize) -> &mut Self {
+        self.floor = value;
+        self
+    }
+}
+
+impl Default for DatagramBdpBufferConfig {
+    fn default() -> Self {
+        Self {
+            multiple: 4.0,
+            floor: 1024 * 1024,
         }
     }
 }
