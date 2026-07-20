@@ -12,6 +12,102 @@ use crate::{
     frame::{Datagram, FrameStruct},
 };
 
+/// ECN codepoint carried by a tunnelled inner IP packet
+///
+/// Distinct from [`crate::EcnCodepoint`], which marks the OUTER UDP socket:
+/// this classifies the traffic a tunnel is about to seal into datagrams, so
+/// the Not-ECT case is first-class (it is the distribution's denominator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramEcn {
+    /// Not ECN-capable transport (`0b00`)
+    NotEct,
+    /// ECN-capable transport, ECT(0) (`0b10`)
+    Ect0,
+    /// ECN-capable transport, ECT(1) (`0b01`)
+    Ect1,
+    /// Congestion experienced (`0b11`)
+    Ce,
+}
+
+impl DatagramEcn {
+    fn from_bits(bits: u8) -> Self {
+        match bits & 0b11 {
+            0b01 => Self::Ect1,
+            0b10 => Self::Ect0,
+            0b11 => Self::Ce,
+            _ => Self::NotEct,
+        }
+    }
+}
+
+/// Caller-supplied classification of an application datagram
+///
+/// A tunnel encrypts its payload before handing it to QUIC, so the inner IP
+/// header is unreadable at this layer; the caller classifies while it still
+/// holds the plaintext (see [`Self::of_inner_ip_packet`]) and passes the
+/// result to `send_datagram_classified`. `Default` is fully unclassified:
+/// no ECN accounting and the shared catch-all flow bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DatagramClass {
+    /// Stable flow key (e.g. a 5-tuple hash) for per-flow queueing
+    pub flow: Option<u64>,
+    /// ECN codepoint of the inner packet's IP header
+    pub ecn: Option<DatagramEcn>,
+}
+
+impl DatagramClass {
+    /// Classify a plaintext IP packet: the ECN codepoint from the IPv4 TOS /
+    /// IPv6 traffic-class field, and a flow key from an FNV-1a hash of the
+    /// TCP/UDP 5-tuple.
+    ///
+    /// The ECN codepoint is read for any well-formed IPv4/IPv6 header; the
+    /// flow key only for first-fragment TCP/UDP packets with readable ports
+    /// (other protocols and IPv6 extension headers fall back to `None`, the
+    /// shared bucket). Non-IP payloads yield the unclassified default.
+    #[must_use]
+    pub fn of_inner_ip_packet(pkt: &[u8]) -> Self {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x100_0000_01b3;
+        let fnv = |chunks: &[&[u8]]| {
+            let mut h = FNV_OFFSET;
+            for chunk in chunks {
+                for &b in *chunk {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(FNV_PRIME);
+                }
+            }
+            h
+        };
+        let Some(&first) = pkt.first() else {
+            return Self::default();
+        };
+        match first >> 4 {
+            4 if pkt.len() >= 20 => {
+                let ecn = Some(DatagramEcn::from_bits(pkt[1]));
+                let ihl = usize::from(first & 0x0f) * 4;
+                let proto = pkt[9];
+                // Ports only exist in the first fragment (offset 0).
+                let frag_offset = (u16::from(pkt[6] & 0x1f) << 8) | u16::from(pkt[7]);
+                let flow = ((proto == 6 || proto == 17)
+                    && frag_offset == 0
+                    && ihl >= 20
+                    && pkt.len() >= ihl + 4)
+                    .then(|| fnv(&[&[proto], &pkt[12..20], &pkt[ihl..ihl + 4]]));
+                Self { flow, ecn }
+            }
+            6 if pkt.len() >= 40 => {
+                let tc = ((pkt[0] & 0x0f) << 4) | (pkt[1] >> 4);
+                let ecn = Some(DatagramEcn::from_bits(tc));
+                let next = pkt[6];
+                let flow = ((next == 6 || next == 17) && pkt.len() >= 44)
+                    .then(|| fnv(&[&[next], &pkt[8..40], &pkt[40..44]]));
+                Self { flow, ecn }
+            }
+            _ => Self::default(),
+        }
+    }
+}
+
 /// API to control datagram traffic
 pub struct Datagrams<'a> {
     pub(super) conn: &'a mut Connection,
@@ -28,6 +124,21 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool, now: Instant) -> Result<(), SendDatagramError> {
+        self.send_classified(data, drop, now, DatagramClass::default())
+    }
+
+    /// [`Self::send`] with a caller-supplied [`DatagramClass`]
+    ///
+    /// The classification feeds the inner-ECN distribution counters in
+    /// `ConnectionStats::datagram_tx` and keys per-flow queueing when the
+    /// AQM runs with more than one flow queue.
+    pub fn send_classified(
+        &mut self,
+        data: Bytes,
+        drop: bool,
+        now: Instant,
+        class: DatagramClass,
+    ) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
         }
@@ -55,6 +166,7 @@ impl Datagrams<'_> {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
+        self.conn.stats.datagram_tx.record_ecn(class.ecn);
         self.conn.datagrams.outgoing_total += data.len();
         self.conn.datagrams.outgoing.push_back(QueuedDatagram {
             queued_at: now,
@@ -460,6 +572,139 @@ mod tests {
         assert_eq!(
             state.outgoing_total, queued_bytes,
             "outgoing_total must stay in sync through AQM drops"
+        );
+    }
+
+    /// Minimal IPv4 packet: 20-byte header + 4 port bytes.
+    fn ipv4_pkt(tos: u8, proto: u8) -> Vec<u8> {
+        let mut pkt = vec![0u8; 24];
+        pkt[0] = 0x45;
+        pkt[1] = tos;
+        pkt[9] = proto;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        pkt[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt
+    }
+
+    /// Minimal IPv6 packet: 40-byte header + 4 port bytes.
+    fn ipv6_pkt(traffic_class: u8, next_header: u8) -> Vec<u8> {
+        let mut pkt = vec![0u8; 44];
+        pkt[0] = 0x60 | (traffic_class >> 4);
+        pkt[1] = (traffic_class & 0x0f) << 4;
+        pkt[6] = next_header;
+        pkt[8..24].copy_from_slice(&[0xfd; 16]);
+        pkt[24..40].copy_from_slice(&[0xfe; 16]);
+        pkt[40..42].copy_from_slice(&1234u16.to_be_bytes());
+        pkt[42..44].copy_from_slice(&80u16.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn classify_ipv4_ecn_codepoints() {
+        // RFC 3168: 0b00 Not-ECT, 0b01 ECT(1), 0b10 ECT(0), 0b11 CE. The
+        // DSCP bits above them must not leak into the classification.
+        for (tos, expected) in [
+            (0b0000_0000, DatagramEcn::NotEct),
+            (0b0000_0001, DatagramEcn::Ect1),
+            (0b0000_0010, DatagramEcn::Ect0),
+            (0b0000_0011, DatagramEcn::Ce),
+            (0b1010_1000, DatagramEcn::NotEct),
+            (0b1010_1010, DatagramEcn::Ect0),
+        ] {
+            let class = DatagramClass::of_inner_ip_packet(&ipv4_pkt(tos, 6));
+            assert_eq!(class.ecn, Some(expected), "tos {tos:#010b}");
+        }
+    }
+
+    #[test]
+    fn classify_ipv6_ecn_spans_the_nibble_boundary() {
+        // The IPv6 traffic class straddles bytes 0 and 1; the ECN bits are
+        // its two low bits, which live in byte 1's high nibble.
+        for (tc, expected) in [
+            (0b0000_0000, DatagramEcn::NotEct),
+            (0b0000_0001, DatagramEcn::Ect1),
+            (0b0000_0010, DatagramEcn::Ect0),
+            (0b0000_0011, DatagramEcn::Ce),
+            (0b1011_1011, DatagramEcn::Ce),
+        ] {
+            let class = DatagramClass::of_inner_ip_packet(&ipv6_pkt(tc, 17));
+            assert_eq!(class.ecn, Some(expected), "traffic class {tc:#010b}");
+        }
+    }
+
+    #[test]
+    fn classify_non_ip_payload_is_unclassified() {
+        // Cover datagrams (0xFF fill), sealed frames, and truncated headers
+        // carry no inner IP header: they must count in no ECN bucket and land
+        // in the shared flow bucket.
+        for payload in [&[][..], &[0xff; 64][..], &[0x45; 12][..], &[0x60; 39][..]] {
+            assert_eq!(
+                DatagramClass::of_inner_ip_packet(payload),
+                DatagramClass::default()
+            );
+        }
+    }
+
+    #[test]
+    fn classify_flow_key_for_tcp_udp_only() {
+        let tcp = DatagramClass::of_inner_ip_packet(&ipv4_pkt(0, 6));
+        let udp = DatagramClass::of_inner_ip_packet(&ipv4_pkt(0, 17));
+        let icmp = DatagramClass::of_inner_ip_packet(&ipv4_pkt(0, 1));
+        assert!(tcp.flow.is_some());
+        assert!(udp.flow.is_some());
+        assert_ne!(tcp.flow, udp.flow, "protocol is part of the 5-tuple");
+        assert!(icmp.flow.is_none(), "ICMP has no ports: shared bucket");
+        assert_eq!(icmp.ecn, Some(DatagramEcn::NotEct), "ECN still classified");
+
+        let v6 = DatagramClass::of_inner_ip_packet(&ipv6_pkt(0, 6));
+        assert!(v6.flow.is_some());
+        assert_ne!(v6.flow, tcp.flow);
+    }
+
+    #[test]
+    fn classify_flow_key_is_stable_per_flow() {
+        let a = DatagramClass::of_inner_ip_packet(&ipv4_pkt(0, 6));
+        let mut longer = ipv4_pkt(0, 6);
+        longer.extend_from_slice(&[0xab; 100]);
+        // Payload bytes past the 5-tuple must not change the key; the ECN
+        // bits must not either (a CE remark mid-flow keeps the flow sticky).
+        let b = DatagramClass::of_inner_ip_packet(&longer);
+        let c = DatagramClass::of_inner_ip_packet(&ipv4_pkt(0b11, 6));
+        assert_eq!(a.flow, b.flow);
+        assert_eq!(a.flow, c.flow);
+    }
+
+    #[test]
+    fn classify_ipv4_non_first_fragment_has_no_flow_key() {
+        // A non-first fragment carries payload bytes where the ports would
+        // be; hashing them would scatter one flow across buckets.
+        let mut pkt = ipv4_pkt(0, 6);
+        pkt[6] = 0x00;
+        pkt[7] = 0x08; // fragment offset 8
+        let class = DatagramClass::of_inner_ip_packet(&pkt);
+        assert!(class.flow.is_none());
+        assert_eq!(class.ecn, Some(DatagramEcn::NotEct));
+    }
+
+    #[test]
+    fn record_ecn_counts_classified_only() {
+        let mut stats = DatagramTxStats::default();
+        stats.record_ecn(None);
+        stats.record_ecn(Some(DatagramEcn::NotEct));
+        stats.record_ecn(Some(DatagramEcn::Ect0));
+        stats.record_ecn(Some(DatagramEcn::Ect0));
+        stats.record_ecn(Some(DatagramEcn::Ect1));
+        stats.record_ecn(Some(DatagramEcn::Ce));
+        assert_eq!(stats.ecn_not_ect, 1);
+        assert_eq!(stats.ecn_ect0, 2);
+        assert_eq!(stats.ecn_ect1, 1);
+        assert_eq!(stats.ecn_ce, 1);
+        assert_eq!(
+            stats.ecn_not_ect + stats.ecn_ect0 + stats.ecn_ect1 + stats.ecn_ce,
+            5,
+            "unclassified datagrams must not be counted anywhere"
         );
     }
 

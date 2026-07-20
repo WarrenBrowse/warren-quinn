@@ -1899,6 +1899,55 @@ fn datagram_send_recv() {
 }
 
 #[test]
+fn datagram_classified_send_counts_inner_ecn() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+
+    // A classified ECT(0) datagram, a classified Not-ECT one, and an
+    // unclassified plain send: the stats must count exactly the first two.
+    let now = pair.time;
+    pair.client_datagrams(client_ch)
+        .send_classified(
+            vec![1; 32].into(),
+            true,
+            now,
+            DatagramClass {
+                flow: Some(7),
+                ecn: Some(DatagramEcn::Ect0),
+            },
+        )
+        .unwrap();
+    pair.client_datagrams(client_ch)
+        .send_classified(
+            vec![2; 32].into(),
+            true,
+            now,
+            DatagramClass {
+                flow: None,
+                ecn: Some(DatagramEcn::NotEct),
+            },
+        )
+        .unwrap();
+    pair.client_datagrams(client_ch)
+        .send(vec![3; 32].into(), true, now)
+        .unwrap();
+    pair.drive();
+
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.datagram_tx.ecn_ect0, 1);
+    assert_eq!(stats.datagram_tx.ecn_not_ect, 1);
+    assert_eq!(stats.datagram_tx.ecn_ect1, 0);
+    assert_eq!(stats.datagram_tx.ecn_ce, 0);
+    // All three still reach the peer: classification never affects delivery.
+    let mut received = 0;
+    while pair.server_datagrams(server_ch).recv().is_some() {
+        received += 1;
+    }
+    assert_eq!(received, 3);
+}
+
+#[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
     const WINDOW: usize = 100;
