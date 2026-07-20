@@ -350,10 +350,16 @@ impl CodelState {
 /// per-flow queueing is off (no AQM, or `flow_queues <= 1`).
 const SHARED_BUCKET: u32 = 0;
 
-/// DRR quantum (RFC 8290 section 4.2): one MTU-sized datagram's worth of
-/// credit per scheduling round, so flows of different packet sizes still
-/// share bandwidth byte-fairly.
-const FQ_QUANTUM: i64 = 1500;
+/// DRR byte credit per scheduling round (RFC 8290 section 4.2 quantum)
+///
+/// Deliberately ~12 full-size datagrams rather than the classic one-MTU
+/// quantum: a per-packet round-robin shreds the per-flow packet trains that
+/// GSO batching and receiver-side GRO coalescing depend on, which measurably
+/// costs clean-path throughput at high rates (13-20% in the fork.11 A/B).
+/// Packet-train turns keep that batching; the sparse-flow latency cost is
+/// bounded by quantum/line_rate (3 ms at 40 Mbit, microseconds at 1 Gbps)
+/// and fresh sparse flows still preempt via the new-flow priority list.
+const FQ_QUANTUM: i64 = 15_000;
 
 /// Maps a caller-supplied flow key onto a queue bucket. Classified flows
 /// spread over `1..=flow_queues`; [`SHARED_BUCKET`] stays reserved so cover
@@ -1007,9 +1013,11 @@ mod tests {
             push(&mut state, 1, 0xbb, 1200, start);
         }
         // Serve the bulk queue with time advancing so its CoDel walks
-        // through first_above_time into the dropping state.
+        // through first_above_time into the dropping state, and past its
+        // FIRST DRR quantum so it has rotated onto the old-flows list (a
+        // flow only holds new-list priority for one quantum after birth).
         let mut now = start + Duration::from_millis(400);
-        for _ in 0..8 {
+        for _ in 0..16 {
             let mut buf = Vec::new();
             state.write(&mut buf, usize::MAX, now, Some(&config), &mut stats);
             now += Duration::from_millis(50);
