@@ -1,0 +1,76 @@
+name: CI
+
+# Runs on the WarrenBrowse org self-hosted arm64 fleet, like every other Warren
+# verification job. Deliberately narrow: this is a THIN fork, so CI answers two
+# questions only, "does it still build" and "is the Warren delta still there".
+# Upstream quinn's own test suite stays upstream's job; duplicating it here would
+# make every re-sync rebase a CI archaeology exercise.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: fmt + check + fork delta
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt
+        # The repo carries its own rustfmt.toml (upstream's), so this checks the
+        # fork against upstream's style, not Warren's.
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: the fork delta is still present
+        # This is the contract with warrenguard. Its
+        # warrenguard-transport-core/src/transport_config.rs calls the two
+        # Initial-fragmentation knobs, which exist only here: that call site is
+        # what makes a repoint to upstream quinn fail to compile (E0599) instead
+        # of silently dropping the GSO gain and the obfuscation. If a re-sync
+        # rebase ever drops one of these, the consumer breaks at its next pin
+        # bump with an error that accuses the consumer. Fail here instead.
+        run: |
+          set -euo pipefail
+          missing=0
+          for sym in initial_datagram_min_size initial_crypto_first_fragment_size \
+                     MAX_TRANSMIT_DATAGRAMS MAX_TRANSMIT_SEGMENTS; do
+            if ! grep -rq "$sym" quinn/src quinn-proto/src quinn-udp/src; then
+              echo "::error::fork symbol '$sym' vanished from the tree"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: the three crates carry the same -fork.N level
+        # The fork level is bumped in lockstep (see CLAUDE.md). A drifted level
+        # means a consumer can pin a tag whose three crates disagree.
+        run: |
+          set -euo pipefail
+          levels="$(grep -hoE '^version = "[^"]*-fork\.[0-9]+"' \
+                    quinn/Cargo.toml quinn-proto/Cargo.toml quinn-udp/Cargo.toml \
+                    | grep -oE 'fork\.[0-9]+' | sort -u)"
+          count="$(printf '%s\n' "$levels" | grep -c . || true)"
+          echo "fork levels found: $levels"
+          if [ "$count" != "1" ]; then
+            echo "::error::the three crates do not share one -fork.N level"
+            exit 1
+          fi

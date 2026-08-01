@@ -30,14 +30,15 @@ that diverges from upstream is a line someone re-resolves at the next re-sync.
   control-plane concept. If a change can live in `warrenguard`, it lives there.
 - **The delta is deliberately small and enumerable**: the authoritative
   per-delta list is README.md section "Deltas vs upstream" (8 deltas as of
-  fork.11: the Initial-fragmentation knobs, GSO transmit sizing, socket-buffer
+  fork.12: the Initial-fragmentation knobs, GSO transmit sizing, socket-buffer
   autosizing, the Apple fast datapath, the BBR repair fixes, the FQ-CoDel
   datagram send-queue AQM, the BDP-adaptive send buffer, and the inner-ECN
   counters), each also committed as an isolated patch at the repo root. Adding
   a delta needs a reason written down in that list.
-- **Since fork.8 the fork has a real git ancestry** on `upstream/0.11.x` (commit
-  `a96949f6`): a re-sync is a `git rebase`, no longer a tree reconstruction. The
-  old orphan history is archived in `archive/orphan-history-fork.7`.
+- **Since fork.8 the fork has a real git ancestry** on `upstream/0.11.x`
+  (commit `33ce0c21` since fork.12): a re-sync is a `git rebase`, no longer a
+  tree reconstruction. The old orphan history is archived in
+  `archive/orphan-history-fork.7`.
 - **`quinn-udp` comes from a different upstream lineage** (tag `quinn-udp-0.6.1`,
   branch `main`) than the other two crates (branch `0.11.x`). That is deliberate:
   the Apple fast datapath targets the udp 0.6 line. Do not "fix" it back to
