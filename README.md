@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/warren-logo.svg" alt="Warren" width="130"/>
+</p>
+
 # warren-quinn
 
 A thin fork of [quinn](https://github.com/quinn-rs/quinn) (quinn 0.11.11,
