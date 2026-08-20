@@ -99,8 +99,15 @@ old tags are unaffected; only `main` was rebuilt.
    warren-core `lastmile-paired.sh` harness (cwnd == cumulative acked bytes
    after 30 s of app-limited streaming). Regression-tested by
    `congestion::bbr::tests` (seeded and from-birth app-limited scenarios
-   stay near target_window; ramp below target still grows). Proposed for
-   upstream.
+   stay near target_window; ramp below target still grows). Proposed
+   upstream as quinn-rs/quinn#2798 (draft). Upstream plans to DELETE the
+   whole bbr module in favour of a spec-faithful BBRv3
+   (quinn-rs/quinn#2481): that implementation carries both fixes natively
+   (draft-05 admission rule in `update_max_bw`; cwnd capped by
+   `max_inflight` on every update), replaces `BbrConfig` with `Bbr3Config`,
+   and reworks pacing. The re-sync that brings it in drops this delta,
+   migrates the `warrenguard` config call site, and is a BEHAVIOUR change:
+   it does not ship without the interleaved A/B bench gate.
 6. **Datagram send-queue AQM** (`TransportConfig::datagram_send_aqm`,
    FQ-CoDel/RFC 8289+8290): the outgoing datagram buffer is a deep FIFO; on a
    path slower than the offered load it holds seconds of standing queue before
