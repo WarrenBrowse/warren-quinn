@@ -1,0 +1,241 @@
+From 181cd0a8237ce80839fa663230e43434a23fb64c Mon Sep 17 00:00:00 2001
+From: poka <poka@p2p.legal>
+Date: Sun, 13 Sep 2026 01:39:58 +0200
+Subject: [PATCH] fix(mtud): a probe lost while the path drops ordinary packets
+ does not narrow the search
+
+---
+ quinn-proto/src/connection/mod.rs  |   6 +-
+ quinn-proto/src/connection/mtud.rs | 161 +++++++++++++++++++++++++++--
+ 2 files changed, 160 insertions(+), 7 deletions(-)
+
+diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
+index 7f3f3a34..a3f1941e 100644
+--- a/quinn-proto/src/connection/mod.rs
++++ b/quinn-proto/src/connection/mod.rs
+@@ -1815,7 +1815,11 @@ impl Connection {
+         if let Some(packet) = lost_mtu_probe {
+             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+             self.remove_in_flight(&info);
+-            self.path.mtud.on_probe_lost();
++            // Ordinary packets lost in this same pass mean the path is dropping
++            // traffic of every size, so the probe was dropped for that reason
++            // and not because it is too big. Passing that on keeps the binary
++            // search from walking its upper bound down on every congestion drop.
++            self.path.mtud.on_probe_lost(!lost_packets.is_empty(), now);
+             self.stats.path.lost_plpmtud_probes += 1;
+         }
+     }
+diff --git a/quinn-proto/src/connection/mtud.rs b/quinn-proto/src/connection/mtud.rs
+index b690731b..03939c28 100644
+--- a/quinn-proto/src/connection/mtud.rs
++++ b/quinn-proto/src/connection/mtud.rs
+@@ -128,9 +128,15 @@ impl MtuDiscovery {
+     }
+ 
+     /// Notifies the [`MtuDiscovery`] that the in-flight MTU probe was lost
+-    pub(crate) fn on_probe_lost(&mut self) {
++    ///
++    /// `path_lossy` says whether ordinary packets were declared lost alongside
++    /// it. A lost probe is evidence about the probed SIZE only while the path is
++    /// otherwise delivering; when the path is dropping packets of every size,
++    /// the probe was dropped for the same reason as the rest and says nothing
++    /// about whether the size fits. See [`EnabledMtuDiscovery::on_probe_lost`].
++    pub(crate) fn on_probe_lost(&mut self, path_lossy: bool, now: Instant) {
+         if let Some(state) = &mut self.state {
+-            state.on_probe_lost();
++            state.on_probe_lost(path_lossy, now);
+         }
+     }
+ 
+@@ -250,9 +256,26 @@ impl EnabledMtuDiscovery {
+     }
+ 
+     /// Called when the in-flight MTU probe was lost
+-    fn on_probe_lost(&mut self) {
++    ///
++    /// `path_lossy` means ordinary packets were declared lost in the same
++    /// detection pass, so the path is dropping traffic of every size and the
++    /// probe's loss carries no information about the probed size. Counting it
++    /// as a failure anyway is what RFC 8899 warns against: the binary search
++    /// lowers its upper bound on every congestion drop and converges far below
++    /// the real PMTU, while retransmitting the probe for as long as the link
++    /// stays congested.
++    ///
++    /// The round is therefore ENDED with the MTU left exactly where it was, to
++    /// be retried at the next activation. Ending it rather than re-probing is
++    /// the point: on a link that stays congested, retrying inside the round is
++    /// the probe storm this avoids.
++    fn on_probe_lost(&mut self, path_lossy: bool, now: Instant) {
+         // We might no longer be searching, e.g. if a black hole was detected
+         if let Phase::Searching(state) = &mut self.phase {
++            if path_lossy {
++                self.phase = Phase::Complete(now + self.config.interval);
++                return;
++            }
+             state.in_flight_probe = None;
+             state.lost_probe_count += 1;
+         }
+@@ -554,7 +577,7 @@ mod tests {
+             if probe_size <= link_payload_size_limit {
+                 mtud.on_acked(SpaceId::Data, probe_pn, probe_size);
+             } else {
+-                mtud.on_probe_lost();
++                mtud.on_probe_lost(false, now);
+             }
+         }
+         probed_sizes
+@@ -587,6 +610,132 @@ mod tests {
+         assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 1);
+     }
+ 
++    #[test]
++    fn a_probe_lost_while_the_path_drops_ordinary_packets_does_not_narrow_the_search() {
++        // A lost probe is evidence about the probed SIZE only while the path is
++        // otherwise delivering. On a congested link the probe is dropped by the
++        // queue like everything else, and reading that as "this size does not
++        // fit" walks the upper bound down until the search settles far below the
++        // real PMTU. Measured on a member's line: 1017 of 1018 probes lost and
++        // the MTU parked at 1200 to 1230 on a path whose real PMTU was 1492.
++        let mut mtud = default_mtud();
++        let now = Instant::now();
++        let first = mtud
++            .poll_transmit(now, 1)
++            .expect("the first probe goes out");
++
++        mtud.on_probe_lost(true, now);
++
++        assert_eq!(
++            mtud.current_mtu(),
++            1_200,
++            "an inconclusive probe must leave the MTU exactly where it was"
++        );
++        assert_eq!(
++            mtud.poll_transmit(now, 2),
++            None,
++            "the round must END rather than re-probe, or a permanently lossy \
++             link reproduces the probe storm this fixes"
++        );
++        let retry = mtud
++            .poll_transmit(now + Duration::from_secs(600), 3)
++            .expect("the search comes back after the interval");
++        assert_eq!(
++            retry, first,
++            "the retry must probe the same size: nothing was learned about it"
++        );
++    }
++
++    #[test]
++    fn a_probe_lost_on_an_otherwise_healthy_path_still_narrows_the_search() {
++        // The other half: when only the probe is lost and ordinary traffic flows,
++        // the size IS the suspect and the binary search must keep working
++        // exactly as upstream. Three retransmits, then a smaller size.
++        let mut mtud = default_mtud();
++        let now = Instant::now();
++        let first = mtud
++            .poll_transmit(now, 1)
++            .expect("the first probe goes out");
++        for pn in 2..=3 {
++            mtud.on_probe_lost(false, now);
++            assert_eq!(
++                mtud.poll_transmit(now, pn),
++                Some(first),
++                "a probe lost on a clean path is retransmitted at the same size"
++            );
++        }
++        mtud.on_probe_lost(false, now);
++        let narrowed = mtud.poll_transmit(now, 4).expect("the search continues");
++        assert!(
++            narrowed < first,
++            "after MAX_PROBE_RETRANSMITS the search must conclude the size is \
++             unsupported and try a smaller one, got {narrowed} against {first}"
++        );
++    }
++
++    #[test]
++    fn black_hole_detector_ignores_congestion_loss_on_a_uniform_size_flow() {
++        // A bulk flow fills every packet, so a congested link produces loss
++        // bursts whose smallest packet is exactly the size that is also getting
++        // through. `acked_mtu` then equals the burst's size, and a strictly-less
++        // comparison finds no packet "larger than the burst" to exonerate it, so
++        // every congestion burst reads as suspicious and four of them reset the
++        // MTU to the floor. A same-size packet acked more recently than the
++        // burst is the evidence that the size is not the problem.
++        let mut mtud = default_mtud();
++        let size = 1452;
++        let mut pn = 1;
++        for _ in 0..8 {
++            // What a congested link looks like: some packets through, some lost,
++            // all of them the same size, the acks arriving first as quinn
++            // processes them (on_ack_received acks, then detects losses).
++            mtud.on_acked(SpaceId::Data, pn, size);
++            pn += 1;
++            mtud.on_non_probe_lost(pn, size);
++            pn += 1;
++            mtud.on_non_probe_lost(pn, size);
++            pn += 1;
++            assert!(
++                !mtud.black_hole_detected(Instant::now()),
++                "congestion on a uniform-size flow must never convict the path \
++                 of an MTU black hole (round starting at pn {pn})"
++            );
++        }
++        assert_eq!(
++            mtud.current_mtu(),
++            default_mtud().current_mtu(),
++            "the MTU must not have been reset to the floor"
++        );
++    }
++
++    #[test]
++    fn black_hole_detector_still_catches_a_real_ceiling_on_a_mixed_size_flow() {
++        // The other half of the discriminant, and the reason the fix above is a
++        // comparison and not a switch: when the packets that get through are
++        // SMALLER than the ones that are lost, the size IS the problem and the
++        // detector must still fire.
++        let mut mtud = default_mtud();
++        let mut pn = 1;
++        let mut detected = false;
++        for _ in 0..8 {
++            mtud.on_acked(SpaceId::Data, pn, 1_250);
++            pn += 1;
++            mtud.on_non_probe_lost(pn, 1_452);
++            pn += 1;
++            mtud.on_non_probe_lost(pn, 1_452);
++            pn += 1;
++            if mtud.black_hole_detected(Instant::now()) {
++                detected = true;
++                break;
++            }
++        }
++        assert!(
++            detected,
++            "a path that passes 1250 and drops 1452 is an MTU ceiling and must \
++             still be detected"
++        );
++    }
++
+     #[test]
+     fn black_hole_detector_ignores_empty_burst() {
+         let mut mtud = default_mtud();
+@@ -684,7 +833,7 @@ mod tests {
+             let probe_size = mtud.poll_transmit(Instant::now(), i);
+             assert!(probe_size.is_some(), "no probe returned for packet {i}");
+ 
+-            mtud.on_probe_lost();
++            mtud.on_probe_lost(false, Instant::now());
+             probe_size.unwrap()
+         });
+ 
+@@ -819,7 +968,7 @@ mod tests {
+                 );
+                 // assert!(mtud.current_mtu > previous_max_size);
+             } else {
+-                mtud.on_probe_lost();
++                mtud.on_probe_lost(false, now);
+             }
+         }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
