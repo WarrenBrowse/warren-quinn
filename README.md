@@ -175,6 +175,9 @@ the primary upgrade path is now a plain `git rebase`.
   `UPSTREAM-PR.md`). Applies clean on upstream `0.11.x` commit `33ce0c21`;
   a submission against upstream **main** needs a manual port (main has moved
   to the 0.12 line).
+- `fork-mtud-probe-loss.patch`: delta 9, the probe-loss discriminant in
+  `quinn-proto/src/connection/mtud.rs` plus its one call site in
+  `connection/mod.rs` (fork-local, two tests included).
 - `fork-gso.patch`: GSO transmit sizing in `quinn/src/connection.rs`
   (fork-local). Applies on tag `quinn-0.11.11` content, unchanged through
   `33ce0c21`.
