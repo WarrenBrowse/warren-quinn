@@ -5,7 +5,7 @@ name = "warren-quinn-proto"
 # the three crates on every fork-side patch so a stale `Cargo.lock` cannot
 # silently drag the upstream crate back in. Base: upstream quinn-proto 0.11.17
 # (branch 0.11.x).
-version = "0.11.17-fork.12"
+version = "0.11.17-fork.13"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

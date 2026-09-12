@@ -141,6 +141,27 @@ old tags are unaffected; only `main` was rebuilt.
    `ConnectionStats::datagram_tx.ecn_{not_ect,ect0,ect1,ce}` count the
    caller-classified inner-packet ECN codepoints at enqueue, the data basis
    for any future mark-instead-of-drop AQM decision.
+9. **A lost MTU probe is evidence about SIZE only on a path that is otherwise
+   delivering** (`MtuDiscovery::on_probe_lost` takes `path_lossy`): upstream
+   counts every lost probe toward `MAX_PROBE_RETRANSMITS` and then calls
+   `next_mtu_to_probe(false)`, which lowers the binary search's upper bound. On
+   a congested link the probe is dropped by the queue like everything else, so
+   the search walks its bound down on each congestion drop and settles far
+   below the real PMTU while retransmitting for as long as the link stays
+   congested. Measured on a member's line (workspace
+   `incidents/2026-09-12-bufferbloat-fixed-probe-budget-reconnect-storm.md`):
+   1017 of 1018 probes lost, MTU parked at 1200 to 1230 on a path whose real
+   PMTU was 1492, and the collapse stopped the moment the uplink queue was
+   bounded externally. When ordinary packets are declared lost in the same
+   detection pass the probe result is inconclusive, so the round ENDS with the
+   MTU untouched and is retried at the next activation; ending it rather than
+   re-probing is what keeps a permanently lossy link from reproducing the probe
+   storm. A path that only loses the probe, which is what a real MTU ceiling
+   looks like, is unaffected and still narrows the search. RFC 8899 sect 4.1
+   is explicit that a PL loss not attributable to probe size must not shrink
+   the search. Covered by `connection::mtud::tests`
+   (`a_probe_lost_while_the_path_drops_ordinary_packets_does_not_narrow_the_search`,
+   `a_probe_lost_on_an_otherwise_healthy_path_still_narrows_the_search`).
 
 ## Patch files (portable form of the deltas)
 

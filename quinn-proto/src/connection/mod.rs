@@ -1851,7 +1851,11 @@ impl Connection {
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
             self.remove_in_flight(&info);
-            self.path.mtud.on_probe_lost();
+            // Ordinary packets lost in this same pass mean the path is dropping
+            // traffic of every size, so the probe was dropped for that reason
+            // and not because it is too big. Passing that on keeps the binary
+            // search from walking its upper bound down on every congestion drop.
+            self.path.mtud.on_probe_lost(!lost_packets.is_empty(), now);
             self.stats.path.lost_plpmtud_probes += 1;
         }
     }
