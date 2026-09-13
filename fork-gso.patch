@@ -1,8 +1,8 @@
 diff --git a/quinn/src/connection.rs b/quinn/src/connection.rs
-index ef9b24f6..1650376f 100644
+index ff449dd6..82a3171c 100644
 --- a/quinn/src/connection.rs
 +++ b/quinn/src/connection.rs
-@@ -907,7 +907,9 @@ impl ConnectionRef {
+@@ -924,7 +924,9 @@ impl ConnectionRef {
                  io_poller: socket.clone().create_io_poller(),
                  socket,
                  runtime,
@@ -13,7 +13,7 @@ index ef9b24f6..1650376f 100644
                  buffered_transmit: None,
              }),
              shared: Shared::default(),
-@@ -1314,11 +1316,18 @@ pub enum SendDatagramError {
+@@ -1331,11 +1333,18 @@ pub enum SendDatagramError {
  ///
  /// This limits the amount of CPU resources consumed by datagram generation,
  /// and allows other tasks (like receiving ACKs) to run in between.
