@@ -28,8 +28,8 @@ use crate::{
     udp_transmit,
 };
 use proto::{
-    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent,
-    StreamId, congestion::Controller,
+    ConnectionError, ConnectionHandle, ConnectionStats, DatagramClass, Dir, EndpointEvent, Side,
+    StreamEvent, StreamId, congestion::Controller,
 };
 
 /// In-progress connection attempt future
@@ -451,7 +451,43 @@ impl Connection {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
         use proto::SendDatagramError::*;
-        match conn.inner.datagrams().send(data, true) {
+        match conn.inner.datagrams().send(data, true, Instant::now()) {
+            Ok(()) => {
+                conn.wake();
+                Ok(())
+            }
+            Err(e) => Err(match e {
+                Blocked(..) => unreachable!(),
+                UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
+                Disabled => SendDatagramError::Disabled,
+                TooLarge => SendDatagramError::TooLarge,
+            }),
+        }
+    }
+
+    /// [`send_datagram()`] with a caller-supplied [`DatagramClass`]
+    ///
+    /// The classification (inner-packet ECN codepoint and flow key, computed
+    /// by the caller while it still holds the plaintext) feeds the inner-ECN
+    /// distribution counters in [`ConnectionStats`] and keys per-flow
+    /// queueing in the send buffer's AQM.
+    ///
+    /// [`send_datagram()`]: Connection::send_datagram
+    pub fn send_datagram_classified(
+        &self,
+        data: Bytes,
+        class: DatagramClass,
+    ) -> Result<(), SendDatagramError> {
+        let conn = &mut *self.0.state.lock("send_datagram_classified");
+        if let Some(ref x) = conn.error {
+            return Err(SendDatagramError::ConnectionLost(x.clone()));
+        }
+        use proto::SendDatagramError::*;
+        match conn
+            .inner
+            .datagrams()
+            .send_classified(data, true, Instant::now(), class)
+        {
             Ok(()) => {
                 conn.wake();
                 Ok(())
@@ -863,7 +899,7 @@ impl Future for SendDatagram<'_> {
         match state
             .inner
             .datagrams()
-            .send(this.data.take().unwrap(), false)
+            .send(this.data.take().unwrap(), false, Instant::now())
         {
             Ok(()) => {
                 state.wake();

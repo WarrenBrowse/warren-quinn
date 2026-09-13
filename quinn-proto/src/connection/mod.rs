@@ -48,7 +48,9 @@ use cid_state::CidState;
 
 mod datagrams;
 use datagrams::DatagramState;
-pub use datagrams::{Datagrams, SendDatagramError};
+#[cfg(test)]
+pub(crate) use datagrams::QUEUED_OVERHEAD;
+pub use datagrams::{DatagramClass, DatagramEcn, Datagrams, SendDatagramError};
 
 mod mtud;
 mod pacing;
@@ -910,7 +912,7 @@ impl Connection {
                     && !can_send.acks
                     && can_send.other
                     && (buf_capacity - builder.datagram_start) == self.path.current_mtu() as usize
-                    && self.datagrams.outgoing.is_empty()),
+                    && self.datagrams.is_empty()),
                 "SendableFrames was {can_send:?}, but only ACKs have been written"
             );
             pad_datagram |= sent.requires_padding;
@@ -3420,7 +3422,13 @@ impl Connection {
         // DATAGRAM
         let mut sent_datagrams = false;
         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
-            match self.datagrams.write(buf, max_size) {
+            match self.datagrams.write(
+                buf,
+                max_size,
+                now,
+                self.config.datagram_send_aqm.as_ref(),
+                &mut self.stats.datagram_tx,
+            ) {
                 true => {
                     sent_datagrams = true;
                     sent.non_retransmits = true;
@@ -3793,7 +3801,7 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|(_, x)| x.challenge_pending)
             || !self.path_responses.is_empty()
-            || self.datagrams.outgoing.can_send_1rtt(max_size)
+            || self.datagrams.can_write(max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
