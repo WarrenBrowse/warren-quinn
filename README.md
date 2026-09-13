@@ -5,7 +5,7 @@
 # warren-quinn
 
 A thin fork of [quinn](https://github.com/quinn-rs/quinn) (quinn 0.11.11,
-quinn-proto 0.11.16, quinn-udp 0.6.1) carrying a small set of transport
+quinn-proto 0.11.17, quinn-udp 0.6.1) carrying a small set of transport
 deltas, published as renamed crates so downstreams inherit them transitively
 (no `[patch.crates-io]` required):
 
@@ -17,12 +17,12 @@ The lib names are unchanged, so consumers depend with a package rename and keep
 `use quinn` untouched:
 
 ```toml
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.16-fork.12", package = "warren-quinn" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.17-fork.13", package = "warren-quinn" }
 ```
 
 The fork level `N` in `-fork.<N>` is repo-wide: all three crates bump it in
-lockstep (quinn `0.11.11-fork.12`, quinn-proto `0.11.16-fork.12`, quinn-udp
-`0.6.1-fork.12`).
+lockstep (quinn `0.11.11-fork.13`, quinn-proto `0.11.17-fork.13`, quinn-udp
+`0.6.1-fork.13`).
 
 `v0.11.16-fork.8` was cut only after a Hetzner A/B bench cleared the behaviour
 changes folded in from upstream 0.11.15/0.11.16, chiefly the **BBR RNG switch
@@ -35,12 +35,38 @@ never cut on this repo without that bench.
 ## Upstream base (true git ancestry)
 
 `main` sits directly on upstream git history: upstream branch `0.11.x` at
-commit `33ce0c21` (the released `quinn-proto-0.11.16` state, which also
-contains quinn 0.11.11 via tag `quinn-0.11.11`, plus upstream's CUBIC
-window-increment saturation fix and a clippy pass), followed by one fork
-commit per concern. `git log upstream/0.11.x..main` therefore lists exactly the fork
-surface, and moving to a newer upstream 0.11.x state is a plain `git rebase`
+commit `d2cf48f1` (the `quinn-proto-0.11.17` line, which also contains quinn
+0.11.11 via tag `quinn-0.11.11`), followed by one fork commit per concern.
+`git log upstream/0.11.x..main` therefore lists exactly the fork surface, and moving to a newer upstream 0.11.x state is a plain `git rebase`
 (or merge) instead of a tree reconstruction.
+
+### What the move from `33ce0c21` to `d2cf48f1` brought in
+
+33 upstream commits, of which four change behaviour Warren depends on:
+
+- **`dcb9eabe`, the black-hole detector fixes** (upstream #2799, backporting
+  #2792 and #2400, closing #2791). On the pre-backport code a bulk transfer of
+  uniformly full-size packets re-arms the detector on every loss burst: an
+  equal-size delivery returned early from `on_non_probe_acked` without
+  advancing `largest_post_loss_packet`, so bursts that preceded it stayed
+  suspicious, and `finish_loss_burst`'s strict comparisons kept judging
+  1200-byte bursts suspicious once the connection had already fallen to
+  `min_mtu`. The reporter measured thousands of detections per connection and
+  a PMTU pinned at 1200 for the rest of the transfer, against 1452 with the
+  fixes. That is the symptom the Warren field report
+  (`incidents/2026-09-12-bufferbloat-fixed-probe-budget-reconnect-storm.md`)
+  measured on a member's line: PMTU parked at 1200 to 1230 on a path whose
+  real PMTU was 1492. Every consumer pinning `fork.12` or older carries the
+  bug; this re-sync is what removes it.
+- **`f650e0f2`**, a double subtraction of `payload_bytes` when evicting
+  outgoing datagrams, and the `DatagramBuffer` rework around it: the send and
+  receive queues now charge per-entry bookkeeping, not payload alone, so a
+  queue of empty datagrams is bounded by memory rather than by a byte count it
+  never moves. The fork's FQ-CoDel queue carries the same accounting
+  (`QUEUED_OVERHEAD`).
+- **`912d648e`**, ACKs bundled into packets that already carry DATAGRAM or
+  STREAM frames, which is every tunnel packet.
+- **`73e168d9`**, pacing state reset on path reset.
 
 One deliberate mix: `quinn-udp` is not the 0.5.15 of branch 0.11.x but an
 overlay of tag `quinn-udp-0.6.1` (commit `38c036ad`, upstream **main**
@@ -146,22 +172,26 @@ old tags are unaffected; only `main` was rebuilt.
    counts every lost probe toward `MAX_PROBE_RETRANSMITS` and then calls
    `next_mtu_to_probe(false)`, which lowers the binary search's upper bound. On
    a congested link the probe is dropped by the queue like everything else, so
-   the search walks its bound down on each congestion drop and settles far
-   below the real PMTU while retransmitting for as long as the link stays
-   congested. Measured on a member's line (workspace
-   `incidents/2026-09-12-bufferbloat-fixed-probe-budget-reconnect-storm.md`):
-   1017 of 1018 probes lost, MTU parked at 1200 to 1230 on a path whose real
-   PMTU was 1492, and the collapse stopped the moment the uplink queue was
-   bounded externally. When ordinary packets are declared lost in the same
-   detection pass the probe result is inconclusive, so the round ENDS with the
-   MTU untouched and is retried at the next activation; ending it rather than
-   re-probing is what keeps a permanently lossy link from reproducing the probe
-   storm. A path that only loses the probe, which is what a real MTU ceiling
-   looks like, is unaffected and still narrows the search. RFC 8899 sect 4.1
-   is explicit that a PL loss not attributable to probe size must not shrink
-   the search. Covered by `connection::mtud::tests`
+   the search walks its bound down on each congestion drop and settles below
+   the real PMTU while retransmitting for as long as the link stays congested.
+   When ordinary packets are declared lost in the same detection pass the probe
+   result is inconclusive, so the round ENDS with the MTU untouched and is
+   retried at the next activation; ending it rather than re-probing is what
+   keeps a permanently lossy link from reproducing the probe storm. A path that
+   only loses the probe, which is what a real MTU ceiling looks like, is
+   unaffected and still narrows the search. RFC 8899 sect 4.1 is explicit that
+   a PL loss not attributable to probe size must not shrink the search.
+   Covered by `connection::mtud::tests`
    (`a_probe_lost_while_the_path_drops_ordinary_packets_does_not_narrow_the_search`,
    `a_probe_lost_on_an_otherwise_healthy_path_still_narrows_the_search`).
+
+   This delta is independent of the black-hole detector fixes the `d2cf48f1`
+   re-sync brought in, and smaller than them: the detector bug was what pinned
+   a production connection at `min_mtu`, and its fix is upstream's. Both tests
+   above pass unchanged against the pre-backport detector, which is how the
+   two were told apart. The delta has no A/B bench of its own yet, because the
+   local narrow-link harness never reproduced the search-bound walk
+   (`warren-core/bench/results/2026-09-13_lastmile_local-container_mtu-probe-loss.md`).
 
 ## Patch files (portable form of the deltas)
 
@@ -172,7 +202,7 @@ the primary upgrade path is now a plain `git rebase`.
 
 - `upstream-initial-fragmentation.patch`: the two Initial-fragmentation knobs
   plus their pair tests, the only delta proposed for upstream (see
-  `UPSTREAM-PR.md`). Applies clean on upstream `0.11.x` commit `33ce0c21`;
+  `UPSTREAM-PR.md`). Applies clean on upstream `0.11.x` commit `d2cf48f1`;
   a submission against upstream **main** needs a manual port (main has moved
   to the 0.12 line).
 - `fork-mtud-probe-loss.patch`: delta 9, the probe-loss discriminant in
@@ -180,7 +210,7 @@ the primary upgrade path is now a plain `git rebase`.
   `connection/mod.rs` (fork-local, two tests included).
 - `fork-gso.patch`: GSO transmit sizing in `quinn/src/connection.rs`
   (fork-local). Applies on tag `quinn-0.11.11` content, unchanged through
-  `33ce0c21`.
+  `d2cf48f1`.
 - `fork-windows-sockbuf.patch`: kernel socket-buffer auto-sizing at socket
   creation, `quinn-udp/src/windows.rs` plus the matching `unix.rs` hunk
   (fork-local). Applies on tag `quinn-udp-0.6.1`.
@@ -193,20 +223,19 @@ the primary upgrade path is now a plain `git rebase`.
   in the order listed here and fix the manifest context by hand.
 
 - `upstream-bbr-startup-cwnd.patch`: the BBR repair fixes (delta 5) plus
-  their regression tests. Applies clean on `33ce0c21`; the `pub(crate)`
+  their regression tests. Applies clean on `d2cf48f1`; the `pub(crate)`
   widening of `RttEstimator::new` the tests need landed upstream in
   `33ce0c21`, so it is no longer part of the fork delta. The same one-token
   STARTUP bug is present on upstream main.
-- `fork-datagram-aqm.patch`: the CoDel datagram-queue AQM (delta 6 as of
-  fork.10): config, queue timestamping, dequeue-time controller, drop stats,
-  and the `now`-carrying `send`/`write` signatures with their call-site
-  updates.
-- `fork-datagram-fqcodel-bdp.patch`: the fork.11 queueing set on top of it
-  (deltas 6-8 final form): FQ-CoDel per-flow queues + DRR, the
-  `DatagramClass` classification API, the BDP-adaptive send buffer with the
-  `Controller::bdp_estimate` hook, and the inner-ECN counters. Applies on
-  top of `fork-datagram-aqm.patch` (the diff spans the ECN-counter,
-  FQ-CoDel and BDP commits of the rebased history).
+- `fork-datagram-fqcodel-bdp.patch`: the whole datagram send-queue delta
+  (deltas 6-8): the AQM config and queue timestamping, FQ-CoDel per-flow
+  queues + DRR, the `DatagramClass` classification API, the BDP-adaptive send
+  buffer with the `Controller::bdp_estimate` hook, the inner-ECN counters,
+  and the `now`-carrying `send`/`write` signatures with their call sites.
+  One patch since the `d2cf48f1` re-sync: upstream reworked the same queue
+  into a `DatagramBuffer` with per-entry accounting, so the fork's four
+  historical steps were re-applied as a single resolution against it rather
+  than re-resolved four times.
 
 The `fork-` prefix marks deltas that stay fork-local per `UPSTREAM-PR.md`;
 the `upstream-` patches are intended for submission.

@@ -1,46 +1,60 @@
 diff --git a/quinn-proto/src/config/mod.rs b/quinn-proto/src/config/mod.rs
-index d0f68fbf..b8ac2277 100644
+index 0a299d03..b8ac2277 100644
 --- a/quinn-proto/src/config/mod.rs
 +++ b/quinn-proto/src/config/mod.rs
-@@ -29,7 +29,8 @@ mod transport;
+@@ -28,7 +28,10 @@ use crate::{
+ mod transport;
  #[cfg(feature = "qlog")]
  pub use transport::QlogConfig;
- pub use transport::{
--    AckFrequencyConfig, DatagramAqmConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig,
+-pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
++pub use transport::{
 +    AckFrequencyConfig, DatagramAqmConfig, DatagramBdpBufferConfig, IdleTimeout,
 +    MtuDiscoveryConfig, TransportConfig,
- };
++};
  
  /// Global configuration for the endpoint, affecting all connections
+ ///
 diff --git a/quinn-proto/src/config/transport.rs b/quinn-proto/src/config/transport.rs
-index 0745e6bb..3f29d0da 100644
+index 0220982f..7cd7ae19 100644
 --- a/quinn-proto/src/config/transport.rs
 +++ b/quinn-proto/src/config/transport.rs
-@@ -55,6 +55,7 @@ pub struct TransportConfig {
+@@ -54,6 +54,8 @@ pub struct TransportConfig {
+     pub(crate) allow_spin: bool,
      pub(crate) datagram_receive_buffer_size: Option<usize>,
      pub(crate) datagram_send_buffer_size: usize,
-     pub(crate) datagram_send_aqm: Option<DatagramAqmConfig>,
++    pub(crate) datagram_send_aqm: Option<DatagramAqmConfig>,
 +    pub(crate) datagram_send_buffer_bdp: Option<DatagramBdpBufferConfig>,
      #[cfg(test)]
      pub(crate) deterministic_packet_numbers: bool,
  
-@@ -359,7 +360,11 @@ impl TransportConfig {
-     /// queue latency at any link speed and gives loss-responsive inner
-     /// traffic (e.g. tunnelled TCP) its congestion signal within one RTT
-     /// instead of after a timeout. Transient bursts shorter than `interval`
--    /// are never dropped.
+@@ -351,6 +353,52 @@ impl TransportConfig {
+         self
+     }
+ 
++    /// Active queue management for the outgoing datagram send buffer
++    ///
++    /// A deep send buffer bounds memory, but on a path slower than the
++    /// application's offered load it becomes a standing queue: every datagram
++    /// waits behind the backlog, adding up to seconds of latency while the
++    /// buffer keeps absorbing instead of signalling. With an AQM configured,
++    /// datagrams whose queue sojourn time stays above `target` for longer
++    /// than `interval` are head-dropped (CoDel, RFC 8289), which bounds
++    /// queue latency at any link speed and gives loss-responsive inner
++    /// traffic (e.g. tunnelled TCP) its congestion signal within one RTT
++    /// instead of after a timeout. Transient bursts shorter than `interval`
 +    /// are never dropped. Caller-classified datagrams are additionally
 +    /// spread across per-flow queues (RFC 8290 shape, see
 +    /// [`DatagramAqmConfig::flow_queues`]) so a bulk flow's standing queue
 +    /// cannot starve or delay a sparse flow multiplexed on the same
 +    /// connection.
-     ///
-     /// `None` disables the AQM: the buffer then only drops oldest-first on
-     /// overflow. Defaults to enabled with [`DatagramAqmConfig::default`].
-@@ -368,6 +373,28 @@ impl TransportConfig {
-         self
-     }
- 
++    ///
++    /// `None` disables the AQM: the buffer then only drops oldest-first on
++    /// overflow. Defaults to enabled with [`DatagramAqmConfig::default`].
++    pub fn datagram_send_aqm(&mut self, value: Option<DatagramAqmConfig>) -> &mut Self {
++        self.datagram_send_aqm = value;
++        self
++    }
++
 +    /// BDP-adaptive sizing of the outgoing datagram send buffer
 +    ///
 +    /// [`Self::datagram_send_buffer_size`] is a fixed worst-case constant; on
@@ -66,50 +80,67 @@ index 0745e6bb..3f29d0da 100644
      /// Whether to force every packet number to be used
      ///
      /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
-@@ -458,6 +485,7 @@ impl Default for TransportConfig {
+@@ -440,6 +488,8 @@ impl Default for TransportConfig {
+             allow_spin: true,
              datagram_receive_buffer_size: Some(STREAM_RWND as usize),
              datagram_send_buffer_size: 1024 * 1024,
-             datagram_send_aqm: Some(DatagramAqmConfig::default()),
++            datagram_send_aqm: Some(DatagramAqmConfig::default()),
 +            datagram_send_buffer_bdp: Some(DatagramBdpBufferConfig::default()),
              #[cfg(test)]
              deterministic_packet_numbers: false,
  
-@@ -497,6 +525,7 @@ impl fmt::Debug for TransportConfig {
+@@ -478,6 +528,8 @@ impl fmt::Debug for TransportConfig {
+             allow_spin,
              datagram_receive_buffer_size,
              datagram_send_buffer_size,
-             datagram_send_aqm,
++            datagram_send_aqm,
 +            datagram_send_buffer_bdp,
              #[cfg(test)]
                  deterministic_packet_numbers: _,
              congestion_controller_factory: _,
-@@ -535,6 +564,7 @@ impl fmt::Debug for TransportConfig {
+@@ -515,6 +567,8 @@ impl fmt::Debug for TransportConfig {
+             .field("allow_spin", allow_spin)
              .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
              .field("datagram_send_buffer_size", datagram_send_buffer_size)
-             .field("datagram_send_aqm", datagram_send_aqm)
++            .field("datagram_send_aqm", datagram_send_aqm)
 +            .field("datagram_send_buffer_bdp", datagram_send_buffer_bdp)
              // congestion_controller_factory not debug
              .field("enable_segmentation_offload", enable_segmentation_offload);
          if cfg!(feature = "qlog") {
-@@ -827,13 +857,14 @@ impl Default for MtuDiscoveryConfig {
+@@ -807,6 +861,107 @@ impl Default for MtuDiscoveryConfig {
      }
  }
  
--/// Parameters for the outgoing-datagram queue AQM (CoDel, RFC 8289)
 +/// Parameters for the outgoing-datagram queue AQM (FQ-CoDel, RFC 8289/8290)
- ///
- /// See [`TransportConfig::datagram_send_aqm`].
- #[derive(Debug, Copy, Clone)]
- pub struct DatagramAqmConfig {
-     pub(crate) target: Duration,
-     pub(crate) interval: Duration,
++///
++/// See [`TransportConfig::datagram_send_aqm`].
++#[derive(Debug, Copy, Clone)]
++pub struct DatagramAqmConfig {
++    pub(crate) target: Duration,
++    pub(crate) interval: Duration,
 +    pub(crate) flow_queues: usize,
- }
- 
- impl DatagramAqmConfig {
-@@ -856,6 +887,20 @@ impl DatagramAqmConfig {
-         self.interval = value;
-         self
-     }
++}
++
++impl DatagramAqmConfig {
++    /// Acceptable queue sojourn time for a datagram waiting in the send buffer.
++    ///
++    /// Sojourn persistently above this starts head-dropping. Defaults to
++    /// 15 ms: looser than the classic 5 ms router setting because this queue
++    /// feeds a congestion-controlled connection whose window growth
++    /// legitimately queues a few RTTs of data during ramp-up.
++    pub fn target(&mut self, value: Duration) -> &mut Self {
++        self.target = value;
++        self
++    }
++
++    /// Sliding window over which the sojourn time must stay above `target`
++    /// before the first drop, and the base period of the drop-rate ramp.
++    ///
++    /// Defaults to 100 ms (the RFC 8289 recommendation, a worst-case RTT).
++    pub fn interval(&mut self, value: Duration) -> &mut Self {
++        self.interval = value;
++        self
++    }
 +
 +    /// Number of hash buckets caller-classified flows are spread across for
 +    /// per-flow queueing (RFC 8290 shape: DRR scheduling across flows, CoDel
@@ -124,13 +155,13 @@ index 0745e6bb..3f29d0da 100644
 +        self.flow_queues = value.max(1);
 +        self
 +    }
- }
- 
- impl Default for DatagramAqmConfig {
-@@ -863,6 +908,52 @@ impl Default for DatagramAqmConfig {
-         Self {
-             target: Duration::from_millis(15),
-             interval: Duration::from_millis(100),
++}
++
++impl Default for DatagramAqmConfig {
++    fn default() -> Self {
++        Self {
++            target: Duration::from_millis(15),
++            interval: Duration::from_millis(100),
 +            flow_queues: 1024,
 +        }
 +    }
@@ -177,9 +208,13 @@ index 0745e6bb..3f29d0da 100644
 +        Self {
 +            multiple: 4.0,
 +            floor: 1024 * 1024,
-         }
-     }
- }
++        }
++    }
++}
++
+ /// Maximum duration of inactivity to accept before timing out the connection
+ ///
+ /// This wraps an underlying [`VarInt`], representing the duration in milliseconds. Values can be
 diff --git a/quinn-proto/src/congestion.rs b/quinn-proto/src/congestion.rs
 index 391e4d19..60df87b0 100644
 --- a/quinn-proto/src/congestion.rs
@@ -267,10 +302,10 @@ index 35f18fe4..aa84693f 100644
      fn startup_cwnd_grows_while_below_target_window() {
          let mut now = Instant::now();
 diff --git a/quinn-proto/src/connection/datagrams.rs b/quinn-proto/src/connection/datagrams.rs
-index 448e7451..d9121360 100644
+index 411f827f..a41e0cab 100644
 --- a/quinn-proto/src/connection/datagrams.rs
 +++ b/quinn-proto/src/connection/datagrams.rs
-@@ -1,17 +1,114 @@
+@@ -1,15 +1,114 @@
  use std::collections::VecDeque;
  
  use bytes::Bytes;
@@ -278,12 +313,12 @@ index 448e7451..d9121360 100644
  use thiserror::Error;
  use tracing::{debug, trace};
  
- use super::Connection;
--use crate::config::DatagramAqmConfig;
+ use super::{Connection, Event};
 +use crate::config::{DatagramAqmConfig, DatagramBdpBufferConfig};
- use crate::connection::stats::DatagramTxStats;
++use crate::connection::stats::DatagramTxStats;
  use crate::{
-     Duration, Instant, TransportError,
+-    TransportError,
++    Duration, Instant, TransportError,
      frame::{Datagram, FrameStruct},
  };
  
@@ -386,10 +421,12 @@ index 448e7451..d9121360 100644
  /// API to control datagram traffic
  pub struct Datagrams<'a> {
      pub(super) conn: &'a mut Connection,
-@@ -28,6 +125,21 @@ impl Datagrams<'_> {
+@@ -25,7 +124,22 @@ impl Datagrams<'_> {
+     /// have been sent.
      ///
      /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
-     pub fn send(&mut self, data: Bytes, drop: bool, now: Instant) -> Result<(), SendDatagramError> {
+-    pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
++    pub fn send(&mut self, data: Bytes, drop: bool, now: Instant) -> Result<(), SendDatagramError> {
 +        self.send_classified(data, drop, now, DatagramClass::default())
 +    }
 +
@@ -408,39 +445,34 @@ index 448e7451..d9121360 100644
          if self.conn.config.datagram_receive_buffer_size.is_none() {
              return Err(SendDatagramError::Disabled);
          }
-@@ -37,29 +149,30 @@ impl Datagrams<'_> {
-         if data.len() > max {
+@@ -33,25 +147,29 @@ impl Datagrams<'_> {
+             .max_size()
+             .ok_or(SendDatagramError::UnsupportedByPeer)?;
+         let send_buffer_size = self.conn.config.datagram_send_buffer_size;
+-        let Some(max_buffer_payload) = send_buffer_size.checked_sub(size_of::<Datagram>()) else {
++        let Some(max_buffer_payload) = send_buffer_size.checked_sub(QUEUED_OVERHEAD) else {
+             return Err(SendDatagramError::TooLarge);
+         };
+         if data.len() > Ord::min(max, max_buffer_payload) {
              return Err(SendDatagramError::TooLarge);
          }
 +        let limit = self.effective_send_buffer_size();
          if drop {
--            while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
--                let prev = self
-+            while self.conn.datagrams.outgoing_total > limit {
-+                let len = self
-                     .conn
-                     .datagrams
--                    .outgoing
--                    .pop_front()
-+                    .evict_from_fattest_flow()
-                     .expect("datagrams.outgoing_total desynchronized");
--                trace!(len = prev.datagram.data.len(), "dropping outgoing datagram");
--                self.conn.datagrams.outgoing_total -= prev.datagram.data.len();
-+                trace!(len, "dropping outgoing datagram");
-                 self.conn.stats.datagram_tx.dropped_overflow += 1;
-             }
--        } else if self.conn.datagrams.outgoing_total + data.len()
--            > self.conn.config.datagram_send_buffer_size
+-            self.conn
+-                .datagrams
+-                .make_space_for(data.len(), send_buffer_size);
+-        } else if !self
+-            .conn
+-            .datagrams
+-            .has_send_buffer_space(data.len(), send_buffer_size)
 -        {
-+        } else if self.conn.datagrams.outgoing_total + data.len() > limit {
++            let evicted = self.conn.datagrams.make_space_for(data.len(), limit);
++            self.conn.stats.datagram_tx.dropped_overflow += evicted;
++        } else if !self.conn.datagrams.has_send_buffer_space(data.len(), limit) {
              self.conn.datagrams.send_blocked = true;
              return Err(SendDatagramError::Blocked(data));
          }
--        self.conn.datagrams.outgoing_total += data.len();
--        self.conn.datagrams.outgoing.push_back(QueuedDatagram {
--            queued_at: now,
--            datagram: Datagram { data },
--        });
+-        self.conn.datagrams.outgoing.push_back(Datagram { data });
 +        self.conn.stats.datagram_tx.record_ecn(class.ecn);
 +        let bucket = bucket_for(class.flow, self.conn.config.datagram_send_aqm.as_ref());
 +        self.conn.datagrams.enqueue(
@@ -453,14 +485,15 @@ index 448e7451..d9121360 100644
          Ok(())
      }
  
-@@ -98,11 +211,43 @@ impl Datagrams<'_> {
+@@ -105,22 +223,312 @@ impl Datagrams<'_> {
      /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
      /// guaranteed not to cause older datagrams to be dropped.
      pub fn send_buffer_space(&self) -> usize {
 -        self.conn
 -            .config
 -            .datagram_send_buffer_size
--            .saturating_sub(self.conn.datagrams.outgoing_total)
+-            .saturating_sub(self.conn.datagrams.outgoing.memory_used())
+-            .saturating_sub(size_of::<Datagram>())
 +        let limit = match (
 +            &self.conn.config.datagram_send_buffer_bdp,
 +            self.conn.datagrams.bdp_ewma,
@@ -470,8 +503,10 @@ index 448e7451..d9121360 100644
 +            }
 +            _ => self.conn.config.datagram_send_buffer_size,
 +        };
-+        limit.saturating_sub(self.conn.datagrams.outgoing_total)
-     }
++        limit
++            .saturating_sub(self.conn.datagrams.outgoing_memory_used())
++            .saturating_sub(QUEUED_OVERHEAD)
++    }
 +
 +    /// Effective send-buffer byte limit for this enqueue: the fixed
 +    /// configured size, shrunk toward the path's measured BDP when adaptive
@@ -486,9 +521,9 @@ index 448e7451..d9121360 100644
 +        };
 +        let bdp = self.conn.datagrams.update_bdp_ewma(sample);
 +        adaptive_send_buffer_limit(configured, config, bdp)
-+    }
-+}
-+
+     }
+ }
+ 
 +/// `clamp(multiple x bdp, floor, configured)`, with the configured cap
 +/// winning over a larger floor (adaptation may only ever SHRINK the buffer)
 +fn adaptive_send_buffer_limit(
@@ -498,13 +533,113 @@ index 448e7451..d9121360 100644
 +) -> usize {
 +    let target = (bdp as f64 * config.multiple) as usize;
 +    target.clamp(config.floor.min(configured), configured)
- }
- 
- /// An outgoing datagram together with the time it entered the send buffer
-@@ -201,19 +346,153 @@ impl CodelState {
-     }
- }
- 
++}
++
++/// An outgoing datagram together with the time it entered the send buffer
++///
++/// The timestamp is what the AQM measures: queue latency is the sojourn time
++/// of the head-of-line datagram, not the buffer's byte occupancy.
++pub(super) struct QueuedDatagram {
++    queued_at: Instant,
++    datagram: Datagram,
++}
++
++impl QueuedDatagram {
++    /// Wire size of the queued datagram's DATAGRAM frame
++    pub(super) fn frame_size(&self, length_prefix: bool) -> usize {
++        self.datagram.size(length_prefix)
++    }
++}
++
++/// Per-entry bookkeeping charged against the send buffer alongside the payload
++///
++/// Payload-only accounting lets an application queue an unbounded number of
++/// empty datagrams inside a finite byte budget, which is the hole upstream
++/// closed by charging `size_of::<Datagram>()` per entry. A queued datagram
++/// here also carries its enqueue timestamp, so the fork charges the size of
++/// the type it actually allocates.
++pub(crate) const QUEUED_OVERHEAD: usize = size_of::<QueuedDatagram>();
++
++/// Head-drop CoDel controller state (RFC 8289) for the outgoing datagram queue
++///
++/// Distilled to the dequeue-time decision: the caller pops the head, asks
++/// [`Self::should_drop`], and either transmits or discards it. Dropping starts
++/// only after the sojourn time has stayed above target for a whole interval,
++/// then escalates as `interval / sqrt(count)` until the queue drains below
++/// target, which bounds queue latency at any link speed without rate tuning.
++#[derive(Default)]
++struct CodelState {
++    /// When the sojourn time first rose above target, plus one interval
++    first_above_time: Option<Instant>,
++    /// Scheduled time of the next drop while in the dropping state
++    drop_next: Option<Instant>,
++    /// Drops in the current dropping episode (sets the escalation rate)
++    count: u64,
++    dropping: bool,
++}
++
++/// Backlog at or below which the AQM never drops (about two full datagrams)
++///
++/// RFC 8289's "one MTU" floor: a nearly-drained queue is proof the link is
++/// keeping up, and dropping the last packets in flight would only starve it.
++const CODEL_MIN_BACKLOG: usize = 3000;
++
++impl CodelState {
++    /// Dequeue-time decision for the queue head: `true` = drop it
++    ///
++    /// `sojourn` is how long the head waited in the buffer and `backlog` the
++    /// queue's byte size before popping it.
++    fn should_drop(
++        &mut self,
++        sojourn: Duration,
++        backlog: usize,
++        now: Instant,
++        config: &DatagramAqmConfig,
++    ) -> bool {
++        if sojourn < config.target || backlog <= CODEL_MIN_BACKLOG {
++            // Queue latency is under control: leave the dropping state.
++            self.first_above_time = None;
++            self.dropping = false;
++            return false;
++        }
++        let first_above = *self.first_above_time.get_or_insert(now + config.interval);
++        if self.dropping {
++            match self.drop_next {
++                Some(drop_next) if now >= drop_next => {
++                    self.count += 1;
++                    self.drop_next = Some(drop_next + Self::backoff(config.interval, self.count));
++                    true
++                }
++                _ => false,
++            }
++        } else if now >= first_above {
++            // Sojourn stayed above target for a full interval: start dropping.
++            // Re-entering shortly after an episode resumes the previous drop
++            // rate instead of restarting the slow ramp (RFC 8289 section 5.4:
++            // a standing queue that comes right back is the same overload).
++            self.count = match self.drop_next {
++                Some(drop_next)
++                    if now.saturating_duration_since(drop_next) < config.interval * 16 =>
++                {
++                    self.count.saturating_sub(2).max(1)
++                }
++                _ => 1,
++            };
++            self.dropping = true;
++            self.drop_next = Some(now + Self::backoff(config.interval, self.count));
++            true
++        } else {
++            false
++        }
++    }
++
++    /// The drop-rate control law: drops accelerate as the square root of the
++    /// episode's drop count, per RFC 8289.
++    fn backoff(interval: Duration, count: u64) -> Duration {
++        Duration::from_secs_f64(interval.as_secs_f64() / (count as f64).sqrt())
++    }
++}
++
 +/// The catch-all bucket: unclassified datagrams, and every datagram when
 +/// per-flow queueing is off (no AQM, or `flow_queues <= 1`).
 +const SHARED_BUCKET: u32 = 0;
@@ -565,14 +700,17 @@ index 448e7451..d9121360 100644
 +
  #[derive(Default)]
  pub(super) struct DatagramState {
-     /// Number of bytes of datagrams that have been received by the local transport but not
-     /// delivered to the application
-     pub(super) recv_buffered: usize,
-     pub(super) incoming: VecDeque<Datagram>,
--    pub(super) outgoing: VecDeque<QueuedDatagram>,
-     pub(super) outgoing_total: usize,
+     pub(super) incoming: DatagramBuffer,
+-    pub(super) outgoing: DatagramBuffer,
++    /// Queued outgoing payload bytes, summed over every active flow
++    pub(super) outgoing_total: usize,
++    /// Queued outgoing datagrams, summed over every active flow
++    ///
++    /// Kept alongside `outgoing_total` so the send-buffer limit can charge
++    /// [`QUEUED_OVERHEAD`] per entry without walking the flow map on the
++    /// enqueue path.
++    outgoing_count: usize,
      pub(super) send_blocked: bool,
--    codel: CodelState,
 +    /// Active flow queues by bucket. With classification off this holds at
 +    /// most [`SHARED_BUCKET`], which reduces to the historic single FIFO.
 +    flows: FxHashMap<u32, FlowQueue>,
@@ -605,6 +743,7 @@ index 448e7451..d9121360 100644
 +    /// the DRR scheduler
 +    pub(super) fn enqueue(&mut self, bucket: u32, datagram: QueuedDatagram) {
 +        self.outgoing_total += datagram.datagram.data.len();
++        self.outgoing_count += 1;
 +        match self.flows.get_mut(&bucket) {
 +            Some(flow) => {
 +                flow.bytes += datagram.datagram.data.len();
@@ -638,7 +777,15 @@ index 448e7451..d9121360 100644
 +        let len = prev.datagram.data.len();
 +        flow.bytes -= len;
 +        self.outgoing_total -= len;
++        self.outgoing_count -= 1;
 +        Some(len)
++    }
++
++    /// Bytes the outgoing queue is charged for: payload plus per-entry
++    /// bookkeeping
++    fn outgoing_memory_used(&self) -> usize {
++        self.outgoing_total
++            .saturating_add(self.outgoing_count.saturating_mul(QUEUED_OVERHEAD))
 +    }
 +
 +    /// Whether no outgoing datagram is queued on any flow
@@ -657,26 +804,65 @@ index 448e7451..d9121360 100644
      pub(super) fn received(
          &mut self,
          datagram: Datagram,
-@@ -249,28 +528,34 @@ impl DatagramState {
+@@ -151,21 +559,28 @@ impl DatagramState {
+         Ok(was_empty)
+     }
+ 
+-    fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
++    /// Evict until a `datagram_len`-byte datagram fits under `send_buffer_size`
++    ///
++    /// Returns how many datagrams were dropped. An empty queue ends the loop:
++    /// a limit smaller than one entry's overhead is reachable through the
++    /// BDP adaptation, and must not panic the enqueue path.
++    fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) -> u64 {
++        let mut evicted = 0;
+         while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
+-            let Some(prev) = self.outgoing.pop_front() else {
++            let Some(len) = self.evict_from_fattest_flow() else {
+                 break;
+             };
+-            trace!(len = prev.data.len(), "dropping outgoing datagram");
++            trace!(len, "dropping outgoing datagram");
++            evicted += 1;
+         }
++        evicted
+     }
+ 
+     fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
+         let Some(total) = self
+-            .outgoing
+-            .memory_used()
++            .outgoing_memory_used()
+             .checked_add(datagram_len)
+-            .and_then(|total| total.checked_add(size_of::<Datagram>()))
++            .and_then(|total| total.checked_add(QUEUED_OVERHEAD))
+         else {
+             return false;
+         };
+@@ -180,43 +595,128 @@ impl DatagramState {
+     /// Used to ensure that reductions in MTU don't get us stuck in a state where we have a datagram
      /// queued but can't send it.
-     pub(super) fn drop_oversized(&mut self, max_payload: usize) {
-         let outgoing_total = &mut self.outgoing_total;
--        self.outgoing.retain(|queued| {
--            let result = queued.datagram.data.len() < max_payload;
+     pub(super) fn drop_oversized(&mut self, max_payload: usize) -> bool {
++        let outgoing_total = &mut self.outgoing_total;
++        let outgoing_count = &mut self.outgoing_count;
+         let mut dropped_any = false;
+-        self.outgoing.queue.retain(|datagram| {
+-            let result = datagram.data.len() <= max_payload;
 -            if !result {
 -                trace!(
 -                    "dropping {} byte datagram violating {} byte limit",
--                    queued.datagram.data.len(),
+-                    datagram.data.len(),
 -                    max_payload
 -                );
--                *outgoing_total -= queued.datagram.data.len();
+-                self.outgoing.payload_bytes -= datagram.data.len();
+-                dropped_any = true;
 -            }
 -            result
 -        });
 +        for flow in self.flows.values_mut() {
 +            let bytes = &mut flow.bytes;
 +            flow.queue.retain(|queued| {
-+                let result = queued.datagram.data.len() < max_payload;
++                let result = queued.datagram.data.len() <= max_payload;
 +                if !result {
 +                    trace!(
 +                        "dropping {} byte datagram violating {} byte limit",
@@ -684,11 +870,14 @@ index 448e7451..d9121360 100644
 +                        max_payload
 +                    );
 +                    *outgoing_total -= queued.datagram.data.len();
++                    *outgoing_count -= 1;
 +                    *bytes -= queued.datagram.data.len();
++                    dropped_any = true;
 +                }
 +                result
 +            });
 +        }
+         dropped_any
      }
  
 -    /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
@@ -696,23 +885,26 @@ index 448e7451..d9121360 100644
      ///
      /// Returns whether a frame was written. At most `max_size` bytes will be written, including
      /// framing.
-     ///
--    /// When `aqm` is configured, queue heads whose sojourn time keeps the
--    /// queue above the latency target are dropped (and counted in `stats`)
--    /// instead of transmitted, oldest first, per the CoDel control law.
+-    pub(super) fn write(&mut self, buf: &mut Vec<u8>, max_size: usize) -> bool {
+-        let datagram = match self.outgoing.pop_front() {
+-            Some(x) => x,
+-            None => return false,
+-        };
++    ///
 +    /// Flows are served DRR round-robin with new-flow priority (RFC 8290);
 +    /// when `aqm` is configured, each flow runs its own CoDel: heads whose
 +    /// sojourn time keeps the queue above the latency target are dropped
 +    /// (and counted in `stats`) instead of transmitted. A drained flow is
 +    /// unregistered, so an idle connection carries no per-flow state.
-     pub(super) fn write(
-         &mut self,
-         buf: &mut Vec<u8>,
-@@ -280,19 +565,51 @@ impl DatagramState {
-         stats: &mut DatagramTxStats,
-     ) -> bool {
-         loop {
--            let queued = match self.outgoing.pop_front() {
++    pub(super) fn write(
++        &mut self,
++        buf: &mut Vec<u8>,
++        max_size: usize,
++        now: Instant,
++        aqm: Option<&DatagramAqmConfig>,
++        stats: &mut DatagramTxStats,
++    ) -> bool {
++        loop {
 +            let (list, bucket) = match (self.new_flows.front(), self.old_flows.front()) {
 +                (Some(&b), _) => (FlowList::New, b),
 +                (None, Some(&b)) => (FlowList::Old, b),
@@ -722,7 +914,13 @@ index 448e7451..d9121360 100644
 +                .flows
 +                .get_mut(&bucket)
 +                .expect("scheduled flow bucket must exist");
-+
+ 
+-        if buf.len() + datagram.size(true) > max_size {
+-            // Future work: we could be more clever about cramming small datagrams into
+-            // mostly-full packets when a larger one is queued first
+-            self.outgoing.push_front(datagram);
+-            return false;
+-        }
 +            if flow.deficit <= 0 {
 +                // Out of credit: refill and move to the back of the old
 +                // list; some other flow gets this turn.
@@ -736,12 +934,8 @@ index 448e7451..d9121360 100644
 +            }
 +
 +            let queued = match flow.queue.pop_front() {
-                 Some(x) => x,
-                 None => {
--                    // An empty queue is by definition below target.
--                    self.codel.first_above_time = None;
--                    self.codel.dropping = false;
--                    return false;
++                Some(x) => x,
++                None => {
 +                    // Drained flow: a new-list flow gets one final round on
 +                    // the old list (RFC 8290: prevents cycling through the
 +                    // priority list), an old-list flow is unregistered.
@@ -756,53 +950,166 @@ index 448e7451..d9121360 100644
 +                        }
 +                    }
 +                    continue;
-                 }
-             };
- 
-             if let Some(config) = aqm {
-                 let sojourn = now.saturating_duration_since(queued.queued_at);
--                if self
++                }
++            };
++
++            if let Some(config) = aqm {
++                let sojourn = now.saturating_duration_since(queued.queued_at);
 +                if flow
-                     .codel
-                     .should_drop(sojourn, self.outgoing_total, now, config)
-                 {
-@@ -302,25 +619,26 @@ impl DatagramState {
-                         "AQM dropping outgoing datagram"
-                     );
-                     self.outgoing_total -= queued.datagram.data.len();
++                    .codel
++                    .should_drop(sojourn, self.outgoing_total, now, config)
++                {
++                    trace!(
++                        len = queued.datagram.data.len(),
++                        sojourn_ms = sojourn.as_millis() as u64,
++                        "AQM dropping outgoing datagram"
++                    );
++                    self.outgoing_total -= queued.datagram.data.len();
++                    self.outgoing_count -= 1;
 +                    flow.bytes -= queued.datagram.data.len();
-                     stats.dropped_aqm += 1;
-                     continue;
-                 }
-             }
- 
--            let datagram = queued.datagram;
--            if buf.len() + datagram.size(true) > max_size {
++                    stats.dropped_aqm += 1;
++                    continue;
++                }
++            }
++
 +            let size = queued.frame_size(true);
 +            if buf.len() + size > max_size {
-                 // Future work: we could be more clever about cramming small datagrams into
-                 // mostly-full packets when a larger one is queued first
--                self.outgoing.push_front(QueuedDatagram {
--                    queued_at: queued.queued_at,
--                    datagram,
--                });
++                // Future work: we could be more clever about cramming small datagrams into
++                // mostly-full packets when a larger one is queued first
 +                flow.queue.push_front(queued);
-                 return false;
-             }
- 
++                return false;
++            }
++
 +            let datagram = queued.datagram;
-             trace!(len = datagram.data.len(), "DATAGRAM");
++            trace!(len = datagram.data.len(), "DATAGRAM");
  
-             self.outgoing_total -= datagram.data.len();
+-        trace!(len = datagram.data.len(), "DATAGRAM");
+-        datagram.encode(true, buf);
+-        true
++            self.outgoing_total -= datagram.data.len();
++            self.outgoing_count -= 1;
 +            flow.bytes -= datagram.data.len();
 +            flow.deficit -= size as i64;
-             datagram.encode(true, buf);
-             return true;
-         }
-@@ -426,6 +744,29 @@ mod tests {
-         }
++            datagram.encode(true, buf);
++            return true;
++        }
      }
  
+     pub(super) fn recv(&mut self) -> Option<Bytes> {
+@@ -243,20 +743,11 @@ impl DatagramBuffer {
+         Some(datagram)
+     }
+ 
+-    fn push_front(&mut self, datagram: Datagram) {
+-        self.payload_bytes += datagram.data.len();
+-        self.queue.push_front(datagram);
+-    }
+-
+     fn memory_used(&self) -> usize {
+         self.payload_bytes
+             .saturating_add(self.queue.len() * size_of::<Datagram>())
+     }
+ 
+-    pub(super) fn can_send_1rtt(&self, max_size: usize) -> bool {
+-        self.queue.front().is_some_and(|x| x.size(true) <= max_size)
+-    }
+-
+     pub(super) fn is_empty(&self) -> bool {
+         self.queue.is_empty()
+     }
+@@ -266,50 +757,613 @@ impl DatagramBuffer {
+ mod tests {
+     use super::*;
+ 
++    fn aqm() -> DatagramAqmConfig {
++        DatagramAqmConfig::default()
++    }
++
++    /// A backlog comfortably above the CoDel floor.
++    const BACKLOG: usize = 64 * 1024;
++
++    #[test]
++    fn codel_never_drops_below_target() {
++        let mut codel = CodelState::default();
++        let config = aqm();
++        let mut now = Instant::now();
++        for _ in 0..1000 {
++            assert!(!codel.should_drop(config.target / 2, BACKLOG, now, &config));
++            now += Duration::from_millis(1);
++        }
++        assert!(!codel.dropping);
++    }
++
++    #[test]
++    fn codel_tolerates_bursts_shorter_than_interval() {
++        let mut codel = CodelState::default();
++        let config = aqm();
++        let mut now = Instant::now();
++        // Sojourn above target, but only for half an interval, then recovery.
++        for _ in 0..5 {
++            for _ in 0..10 {
++                assert!(!codel.should_drop(config.target * 2, BACKLOG, now, &config));
++                now += config.interval / 20;
++            }
++            assert!(!codel.should_drop(config.target / 2, BACKLOG, now, &config));
++        }
++    }
++
++    #[test]
++    fn codel_drops_after_sustained_standing_queue_then_escalates() {
++        let mut codel = CodelState::default();
++        let config = aqm();
++        let mut now = Instant::now();
++        let mut drops = 0u32;
++        let mut first_drop_at = None;
++        let start = now;
++        // A persistent standing queue: sojourn pinned above target.
++        for _ in 0..400 {
++            if codel.should_drop(config.target * 4, BACKLOG, now, &config) {
++                drops += 1;
++                first_drop_at.get_or_insert(now);
++            }
++            now += Duration::from_millis(5);
++        }
++        let first = first_drop_at.expect("a standing queue must eventually drop");
++        assert!(
++            first.saturating_duration_since(start) >= config.interval,
++            "the first drop must wait out a full interval"
++        );
++        assert!(
++            drops > 5,
++            "the drop rate must escalate while the queue stands, got {drops}"
++        );
++        assert!(codel.dropping);
++    }
++
++    #[test]
++    fn codel_stops_dropping_once_queue_drains() {
++        let mut codel = CodelState::default();
++        let config = aqm();
++        let mut now = Instant::now();
++        for _ in 0..400 {
++            codel.should_drop(config.target * 4, BACKLOG, now, &config);
++            now += Duration::from_millis(5);
++        }
++        assert!(codel.dropping);
++        assert!(!codel.should_drop(config.target / 4, BACKLOG, now, &config));
++        assert!(!codel.dropping, "sojourn below target must end the episode");
++    }
++
++    #[test]
++    fn codel_spares_a_nearly_empty_queue() {
++        let mut codel = CodelState::default();
++        let config = aqm();
++        let mut now = Instant::now();
++        // Sojourn far above target but almost nothing queued: the link is
++        // keeping up, dropping would only starve it.
++        for _ in 0..400 {
++            assert!(!codel.should_drop(config.target * 10, CODEL_MIN_BACKLOG, now, &config));
++            now += Duration::from_millis(5);
++        }
++    }
++
 +    /// Enqueue a `len`-byte payload whose bytes tag its flow, on `bucket`,
 +    /// at `queued_at`.
 +    fn push(state: &mut DatagramState, bucket: u32, tag: u8, len: usize, queued_at: Instant) {
@@ -827,38 +1134,46 @@ index 448e7451..d9121360 100644
 +    }
 +
      #[test]
-     fn write_head_drops_stale_datagrams_and_counts_them() {
+-    fn make_space_for_accounts_for_new_datagram() {
++    fn write_head_drops_stale_datagrams_and_counts_them() {
          let mut state = DatagramState::default();
-@@ -434,15 +775,8 @@ mod tests {
-         let start = Instant::now();
-         // A queue whose head has been waiting far beyond target for well over
-         // an interval, deep enough to stay above the backlog floor.
--        let payload = Bytes::from_static(&[0u8; 1000]);
-         for _ in 0..64 {
--            state.outgoing.push_back(QueuedDatagram {
--                queued_at: start,
--                datagram: Datagram {
--                    data: payload.clone(),
--                },
--            });
--            state.outgoing_total += payload.len();
+-        state.outgoing.push_back(Datagram {
+-            data: Bytes::from_static(&[0; 7]),
+-        });
+-        state.outgoing.push_back(Datagram {
+-            data: Bytes::from_static(&[0; 2]),
+-        });
+-        state.make_space_for(4, 10 + 2 * size_of::<Datagram>());
++        let config = aqm();
++        let mut stats = DatagramTxStats::default();
++        let start = Instant::now();
++        // A queue whose head has been waiting far beyond target for well over
++        // an interval, deep enough to stay above the backlog floor.
++        for _ in 0..64 {
 +            push(&mut state, SHARED_BUCKET, 0, 1000, start);
-         }
-         let now = start + Duration::from_millis(500);
-         // Prime the controller past first_above_time, as a live queue would
-@@ -456,27 +790,153 @@ mod tests {
-             stats.dropped_aqm > 0,
-             "stale heads must be AQM-dropped before delivery"
-         );
--        let queued_bytes: usize = state.outgoing.iter().map(|d| d.datagram.data.len()).sum();
-         assert_eq!(
--            state.outgoing_total, queued_bytes,
++        }
++        let now = start + Duration::from_millis(500);
++        // Prime the controller past first_above_time, as a live queue would
++        // have done on earlier dequeues.
++        let mut buf = Vec::new();
++        assert!(state.write(&mut buf, usize::MAX, now, Some(&config), &mut stats));
++        let later = now + Duration::from_millis(200);
++        let mut buf = Vec::new();
++        assert!(state.write(&mut buf, usize::MAX, later, Some(&config), &mut stats));
++        assert!(
++            stats.dropped_aqm > 0,
++            "stale heads must be AQM-dropped before delivery"
++        );
++        assert_eq!(
 +            state.outgoing_total,
 +            recount(&state),
-             "outgoing_total must stay in sync through AQM drops"
-         );
-     }
++            "outgoing_total must stay in sync through AQM drops"
++        );
++    }
  
+-        assert_eq!(state.outgoing.queue.len(), 1);
+-        assert_eq!(state.outgoing.queue[0].data.len(), 2);
+-        assert_eq!(state.outgoing.payload_bytes, 2);
 +    /// Minimal IPv4 packet: 20-byte header + 4 port bytes.
 +    fn ipv4_pkt(tos: u8, proto: u8) -> Vec<u8> {
 +        let mut pkt = vec![0u8; 24];
@@ -992,28 +1307,23 @@ index 448e7451..d9121360 100644
 +        );
 +    }
 +
-     #[test]
-     fn write_without_aqm_never_drops() {
-         let mut state = DatagramState::default();
-         let mut stats = DatagramTxStats::default();
-         let start = Instant::now();
--        let payload = Bytes::from_static(&[0u8; 1000]);
-         for _ in 0..64 {
--            state.outgoing.push_back(QueuedDatagram {
--                queued_at: start,
--                datagram: Datagram {
--                    data: payload.clone(),
--                },
--            });
--            state.outgoing_total += payload.len();
++    #[test]
++    fn write_without_aqm_never_drops() {
++        let mut state = DatagramState::default();
++        let mut stats = DatagramTxStats::default();
++        let start = Instant::now();
++        for _ in 0..64 {
 +            push(&mut state, SHARED_BUCKET, 0, 1000, start);
-         }
-         let now = start + Duration::from_secs(10);
-         let mut delivered = 0;
-@@ -487,6 +947,268 @@ mod tests {
-         assert_eq!(delivered, 64);
-         assert_eq!(stats.dropped_aqm, 0);
-     }
++        }
++        let now = start + Duration::from_secs(10);
++        let mut delivered = 0;
++        let mut buf = Vec::new();
++        while state.write(&mut buf, usize::MAX, now, None, &mut stats) {
++            delivered += 1;
++        }
++        assert_eq!(delivered, 64);
++        assert_eq!(stats.dropped_aqm, 0);
++    }
 +
 +    #[test]
 +    fn single_bucket_preserves_fifo_order() {
@@ -1276,23 +1586,157 @@ index 448e7451..d9121360 100644
 +            "a head that cannot fit must not report writability"
 +        );
 +    }
++
++    /// Queued datagrams across every flow, recounted from scratch.
++    fn recount_entries(state: &DatagramState) -> usize {
++        state.flows.values().map(|q| q.queue.len()).sum()
++    }
++
++    #[test]
++    fn make_space_for_accounts_for_the_new_datagram() {
++        let mut state = DatagramState::default();
++        let now = Instant::now();
++        push(&mut state, SHARED_BUCKET, 0xaa, 7, now);
++        push(&mut state, SHARED_BUCKET, 0xbb, 2, now);
++
++        assert_eq!(state.make_space_for(4, 10 + 2 * QUEUED_OVERHEAD), 1);
++
++        assert_eq!(recount_entries(&state), 1);
++        assert_eq!(state.outgoing_total, 2);
++        assert_eq!(state.outgoing_count, 1);
+     }
+ 
+     #[test]
+     fn make_space_for_handles_overflowing_capacity_check() {
+         let mut state = DatagramState::default();
+-        state.outgoing.queue.push_back(Datagram {
+-            data: Bytes::from_static(&[0]),
+-        });
+-        state.outgoing.payload_bytes = usize::MAX - 1;
++        let now = Instant::now();
++        push(&mut state, SHARED_BUCKET, 0xaa, 1, now);
++        // A byte count near the top of the range must not wrap the
++        // `used + len + overhead` sum into a value that looks like room.
++        state.outgoing_total = usize::MAX - 1;
++        state.flows.get_mut(&SHARED_BUCKET).unwrap().bytes = usize::MAX - 1;
+ 
+-        state.make_space_for(2, usize::MAX);
++        assert_eq!(state.make_space_for(2, usize::MAX), 1);
+ 
+-        assert!(state.outgoing.is_empty());
+-        assert_eq!(state.outgoing.payload_bytes, usize::MAX - 2);
++        assert!(state.is_empty());
++        assert_eq!(state.outgoing_count, 0);
+     }
+ 
+     #[test]
+     fn make_space_for_accounts_for_empty_datagram_metadata() {
+         let mut state = DatagramState::default();
++        let now = Instant::now();
++        // Payload-only accounting would let this queue grow without bound:
++        // every entry costs zero bytes and the window never fills.
+         for _ in 0..2 {
+-            state.outgoing.push_back(Datagram { data: Bytes::new() });
++            push(&mut state, SHARED_BUCKET, 0, 0, now);
+         }
+-        let window = 2 * size_of::<Datagram>();
++        let window = 2 * QUEUED_OVERHEAD;
+ 
+         assert!(!state.has_send_buffer_space(0, window));
+-        state.make_space_for(0, window);
+-        assert_eq!(state.outgoing.queue.len(), 1);
++        assert_eq!(state.make_space_for(0, window), 1);
++        assert_eq!(recount_entries(&state), 1);
+         assert!(state.has_send_buffer_space(0, window));
+-        state.outgoing.push_back(Datagram { data: Bytes::new() });
+-        assert_eq!(state.outgoing.memory_used(), window);
++        push(&mut state, SHARED_BUCKET, 0, 0, now);
++        assert_eq!(state.outgoing_memory_used(), window);
+     }
+ 
+     #[test]
+@@ -320,18 +1374,56 @@ mod tests {
+     #[test]
+     fn drop_oversized_keeps_datagrams_at_limit() {
+         let mut state = DatagramState::default();
+-        state.outgoing.push_back(Datagram {
+-            data: Bytes::from_static(&[0; 10]),
+-        });
+-        state.outgoing.push_back(Datagram {
+-            data: Bytes::from_static(&[0; 11]),
+-        });
++        let now = Instant::now();
++        push(&mut state, SHARED_BUCKET, 0xaa, 10, now);
++        push(&mut state, SHARED_BUCKET, 0xbb, 11, now);
+ 
+         assert!(state.drop_oversized(10));
+ 
+-        assert_eq!(state.outgoing.queue.len(), 1);
+-        assert_eq!(state.outgoing.queue[0].data.len(), 10);
+-        assert_eq!(state.outgoing.payload_bytes, 10);
++        assert_eq!(recount_entries(&state), 1);
++        assert_eq!(state.outgoing_total, 10);
++        assert_eq!(state.outgoing_count, 1);
++    }
++
++    #[test]
++    fn outgoing_count_tracks_every_queue_mutation() {
++        let mut state = DatagramState::default();
++        let config = aqm();
++        let mut stats = DatagramTxStats::default();
++        let start = Instant::now();
++        let mut buf = Vec::new();
++
++        // One bucket, so the same CoDel state sees every visit.
++        for tag in 0..8u8 {
++            push(&mut state, SHARED_BUCKET, tag, 1200, start);
++        }
++        assert_eq!(state.outgoing_count, recount_entries(&state));
++
++        // Transmit one.
++        assert!(state.write(&mut buf, 65_535, start, None, &mut stats));
++        assert_eq!(state.outgoing_count, recount_entries(&state));
++
++        // Head-drop one: the first visit above target only arms the interval,
++        // the visit after it elapses is the one that drops.
++        let late = start + config.target * 4;
++        state.write(&mut buf, 65_535, late, Some(&config), &mut stats);
++        state.write(
++            &mut buf,
++            65_535,
++            late + config.interval * 2,
++            Some(&config),
++            &mut stats,
++        );
++        assert!(stats.dropped_aqm > 0, "the AQM must have dropped a head");
++        assert_eq!(state.outgoing_count, recount_entries(&state));
++
++        // Prune by size, then evict for space.
++        state.drop_oversized(600);
++        assert_eq!(state.outgoing_count, recount_entries(&state));
++        state.make_space_for(1200, 0);
++        assert_eq!(state.outgoing_count, recount_entries(&state));
++        assert_eq!(state.outgoing_count, 0);
++        assert_eq!(state.outgoing_total, 0);
+     }
  }
  
- /// Errors that can arise when sending a datagram
 diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
-index 8b4b7aef..7f3f3a34 100644
+index 6aa2a82b..9f102abc 100644
 --- a/quinn-proto/src/connection/mod.rs
 +++ b/quinn-proto/src/connection/mod.rs
-@@ -48,7 +48,7 @@ use cid_state::CidState;
+@@ -48,7 +48,9 @@ use cid_state::CidState;
  
  mod datagrams;
  use datagrams::DatagramState;
 -pub use datagrams::{Datagrams, SendDatagramError};
++#[cfg(test)]
++pub(crate) use datagrams::QUEUED_OVERHEAD;
 +pub use datagrams::{DatagramClass, DatagramEcn, Datagrams, SendDatagramError};
  
  mod mtud;
  mod pacing;
-@@ -901,7 +901,7 @@ impl Connection {
+@@ -910,7 +912,7 @@ impl Connection {
                      && !can_send.acks
                      && can_send.other
                      && (buf_capacity - builder.datagram_start) == self.path.current_mtu() as usize
@@ -1301,27 +1745,51 @@ index 8b4b7aef..7f3f3a34 100644
                  "SendableFrames was {can_send:?}, but only ACKs have been written"
              );
              pad_datagram |= sent.requires_padding;
-@@ -3745,11 +3745,7 @@ impl Connection {
+@@ -3420,7 +3422,13 @@ impl Connection {
+         // DATAGRAM
+         let mut sent_datagrams = false;
+         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
+-            match self.datagrams.write(buf, max_size) {
++            match self.datagrams.write(
++                buf,
++                max_size,
++                now,
++                self.config.datagram_send_aqm.as_ref(),
++                &mut self.stats.datagram_tx,
++            ) {
+                 true => {
+                     sent_datagrams = true;
+                     sent.non_retransmits = true;
+@@ -3793,7 +3801,7 @@ impl Connection {
                  .as_ref()
                  .is_some_and(|(_, x)| x.challenge_pending)
              || !self.path_responses.is_empty()
--            || self
--                .datagrams
--                .outgoing
--                .front()
--                .is_some_and(|x| x.frame_size(true) <= max_size)
+-            || self.datagrams.outgoing.can_send_1rtt(max_size)
 +            || self.datagrams.can_write(max_size)
      }
  
      /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
 diff --git a/quinn-proto/src/connection/stats.rs b/quinn-proto/src/connection/stats.rs
-index 2a5f3112..1fab8719 100644
+index 8df96ef4..69883265 100644
 --- a/quinn-proto/src/connection/stats.rs
 +++ b/quinn-proto/src/connection/stats.rs
-@@ -170,6 +170,37 @@ pub struct DatagramTxStats {
-     pub dropped_overflow: u64,
-     /// Datagrams head-dropped by the CoDel AQM (queue sojourn above target)
-     pub dropped_aqm: u64,
+@@ -159,6 +159,52 @@ pub struct PathStats {
+     pub current_mtu: u16,
+ }
+ 
++/// Statistics about the outgoing application-datagram queue
++///
++/// Datagrams queued by `send_datagram` wait in a send buffer until the
++/// connection can transmit them. Both counters here are drops that happen
++/// silently from the sender's point of view (`send_datagram` returned `Ok`),
++/// so they are the only visibility an application has into queue pressure.
++#[derive(Default, Debug, Copy, Clone)]
++#[non_exhaustive]
++pub struct DatagramTxStats {
++    /// Datagrams evicted because the send buffer was full (drop-oldest)
++    pub dropped_overflow: u64,
++    /// Datagrams head-dropped by the CoDel AQM (queue sojourn above target)
++    pub dropped_aqm: u64,
 +    /// Datagrams accepted into the send buffer whose inner packet was Not-ECT
 +    ///
 +    /// The four `ecn_*` counters record the ECN codepoint distribution of the
@@ -1353,11 +1821,20 @@ index 2a5f3112..1fab8719 100644
 +            Some(DatagramEcn::Ce) => self.ecn_ce += 1,
 +        }
 +    }
- }
- 
++}
++
  /// Connection statistics
+ #[derive(Debug, Default, Copy, Clone)]
+ #[non_exhaustive]
+@@ -173,4 +219,6 @@ pub struct ConnectionStats {
+     pub frame_rx: FrameStats,
+     /// Statistics related to the current transmission path
+     pub path: PathStats,
++    /// Statistics about the outgoing application-datagram queue
++    pub datagram_tx: DatagramTxStats,
+ }
 diff --git a/quinn-proto/src/lib.rs b/quinn-proto/src/lib.rs
-index 51b0eb87..cd1532b8 100644
+index 5982b690..cd1532b8 100644
 --- a/quinn-proto/src/lib.rs
 +++ b/quinn-proto/src/lib.rs
 @@ -44,10 +44,10 @@ pub use bloom_token_log::BloomTokenLog;
@@ -1375,13 +1852,12 @@ index 51b0eb87..cd1532b8 100644
  };
  #[cfg(feature = "qlog")]
  pub use connection::qlog::QlogStream;
-@@ -59,9 +59,9 @@ mod config;
+@@ -59,8 +59,9 @@ mod config;
  #[cfg(feature = "qlog")]
  pub use config::QlogConfig;
  pub use config::{
--    AckFrequencyConfig, ClientConfig, ConfigError, DatagramAqmConfig, EndpointConfig, IdleTimeout,
--    MtuDiscoveryConfig, ServerConfig, StdSystemTime, TimeSource, TransportConfig,
--    ValidationTokenConfig,
+-    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
+-    ServerConfig, StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
 +    AckFrequencyConfig, ClientConfig, ConfigError, DatagramAqmConfig, DatagramBdpBufferConfig,
 +    EndpointConfig, IdleTimeout, MtuDiscoveryConfig, ServerConfig, StdSystemTime, TimeSource,
 +    TransportConfig, ValidationTokenConfig,
@@ -1389,10 +1865,53 @@ index 51b0eb87..cd1532b8 100644
  
  pub mod crypto;
 diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
-index 6f6fb6be..ffccba3a 100644
+index 6aa2d45c..edd38055 100644
 --- a/quinn-proto/src/tests/mod.rs
 +++ b/quinn-proto/src/tests/mod.rs
-@@ -1898,6 +1898,55 @@ fn datagram_send_recv() {
+@@ -28,6 +28,7 @@ use super::*;
+ use crate::{
+     Duration, Instant,
+     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
++    connection::QUEUED_OVERHEAD,
+     crypto::rustls::QuicServerConfig,
+     frame::FrameStruct,
+     transport_parameters::TransportParameters,
+@@ -2218,9 +2219,10 @@ fn tail_loss_small_segment_size() {
+     // sending a ping.  These are small enough that the segment_size is less than the
+     // INITIAL_MTU.
+     info!("Sending datagram batch");
++    let now = pair.time;
+     for _ in 0..DGRAM_NUM {
+         pair.client_datagrams(client_ch)
+-            .send(vec![0; DGRAM_LEN].into(), false)
++            .send(vec![0; DGRAM_LEN].into(), false, now)
+             .unwrap();
+     }
+ 
+@@ -2265,9 +2267,10 @@ fn tail_loss_respect_max_datagrams() {
+ 
+     // start sending datagram batches but the first should be a TLP
+     info!("Sending datagram batch");
++    let now = pair.time;
+     for _ in 0..DGRAM_NUM {
+         pair.client_datagrams(client_ch)
+-            .send(vec![0; DGRAM_LEN].into(), false)
++            .send(vec![0; DGRAM_LEN].into(), false, now)
+             .unwrap();
+     }
+ 
+@@ -2287,8 +2290,9 @@ fn datagram_send_recv() {
+     assert_matches!(pair.client_datagrams(client_ch).max_size(), Some(x) if x > 0);
+ 
+     const DATA: &[u8] = b"whee";
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(DATA.into(), true)
++        .send(DATA.into(), true, now)
+         .unwrap();
+     pair.drive();
+     assert_matches!(
+@@ -2299,6 +2303,55 @@ fn datagram_send_recv() {
      assert_matches!(pair.server_datagrams(server_ch).recv(), None);
  }
  
@@ -1448,8 +1967,370 @@ index 6f6fb6be..ffccba3a 100644
  #[test]
  fn datagram_recv_buffer_overflow() {
      let _guard = subscribe();
+@@ -2324,14 +2377,15 @@ fn datagram_recv_buffer_overflow() {
+     const DATA1: &[u8] = &[0xAB; (PAYLOAD_WINDOW / 3) + 1];
+     const DATA2: &[u8] = &[0xBC; (PAYLOAD_WINDOW / 3) + 1];
+     const DATA3: &[u8] = &[0xCD; (PAYLOAD_WINDOW / 3) + 1];
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(DATA1.into(), true)
++        .send(DATA1.into(), true, now)
+         .unwrap();
+     pair.client_datagrams(client_ch)
+-        .send(DATA2.into(), true)
++        .send(DATA2.into(), true, now)
+         .unwrap();
+     pair.client_datagrams(client_ch)
+-        .send(DATA3.into(), true)
++        .send(DATA3.into(), true, now)
+         .unwrap();
+     pair.drive();
+     assert_matches!(
+@@ -2342,8 +2396,9 @@ fn datagram_recv_buffer_overflow() {
+     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA3);
+     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+ 
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(DATA1.into(), true)
++        .send(DATA1.into(), true, now)
+         .unwrap();
+     pair.drive();
+     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA1);
+@@ -2354,7 +2409,7 @@ fn datagram_recv_buffer_overflow() {
+ fn datagram_send_buffer_overflow() {
+     let _guard = subscribe();
+     const PAYLOAD_WINDOW: usize = 100;
+-    const METADATA_WINDOW: usize = 2 * size_of::<Datagram>();
++    const METADATA_WINDOW: usize = 2 * QUEUED_OVERHEAD;
+     const WINDOW: usize = PAYLOAD_WINDOW + METADATA_WINDOW;
+     let client_config = {
+         let mut config = client_config();
+@@ -2371,8 +2426,9 @@ fn datagram_send_buffer_overflow() {
+     // `payload_bytes` bookkeeping must survive sustained eviction
+     const LEN: usize = (PAYLOAD_WINDOW / 3) + 1;
+     for i in 0..10u8 {
++        let now = pair.time;
+         pair.client_datagrams(client_ch)
+-            .send(vec![i; LEN].into(), true)
++            .send(vec![i; LEN].into(), true, now)
+             .unwrap();
+     }
+     pair.drive();
+@@ -2397,22 +2453,24 @@ fn datagram_send_buffer_space_preserves_queued_datagrams() {
+     let mut pair = Pair::default();
+     let mut client_config = client_config();
+     let mut transport_config = TransportConfig::default();
+-    transport_config.datagram_send_buffer_size(100 + 3 * size_of::<Datagram>());
++    transport_config.datagram_send_buffer_size(100 + 3 * QUEUED_OVERHEAD);
+     client_config.transport_config(transport_config.into());
+     let (client_ch, server_ch) = pair.connect_with(client_config);
+ 
+     let first = Bytes::from_static(&[1; 7]);
+     let second = Bytes::from_static(&[2; 2]);
+     for data in [&first, &second] {
++        let now = pair.time;
+         pair.client_datagrams(client_ch)
+-            .send(data.clone(), true)
++            .send(data.clone(), true, now)
+             .unwrap();
+     }
+     let available = pair.client_datagrams(client_ch).send_buffer_space();
+     assert!(available > 0);
+     let third = Bytes::from(vec![3; available]);
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(third.clone(), true)
++        .send(third.clone(), true, now)
+         .unwrap();
+     pair.drive();
+ 
+@@ -2428,18 +2486,20 @@ fn datagram_larger_than_send_buffer_is_too_large() {
+     let mut pair = Pair::default();
+     let mut client_config = client_config();
+     let mut transport_config = TransportConfig::default();
+-    transport_config.datagram_send_buffer_size(1 + size_of::<Datagram>());
++    transport_config.datagram_send_buffer_size(1 + QUEUED_OVERHEAD);
+     client_config.transport_config(transport_config.into());
+     let (client_ch, _) = pair.connect_with(client_config);
+ 
++    let now = pair.time;
+     assert_matches!(
+         pair.client_datagrams(client_ch)
+-            .send(Bytes::from_static(&[0; 2]), true),
++            .send(Bytes::from_static(&[0; 2]), true, now),
+         Err(SendDatagramError::TooLarge)
+     );
++    let now = pair.time;
+     assert_matches!(
+         pair.client_datagrams(client_ch)
+-            .send(Bytes::from_static(&[0; 2]), false),
++            .send(Bytes::from_static(&[0; 2]), false, now),
+         Err(SendDatagramError::TooLarge)
+     );
+ }
+@@ -2447,12 +2507,7 @@ fn datagram_larger_than_send_buffer_is_too_large() {
+ #[test]
+ fn datagram_send_buffer_metadata_boundaries() {
+     let _guard = subscribe();
+-    for window in [
+-        0,
+-        size_of::<Datagram>() - 1,
+-        size_of::<Datagram>(),
+-        size_of::<Datagram>() + 1,
+-    ] {
++    for window in [0, QUEUED_OVERHEAD - 1, QUEUED_OVERHEAD, QUEUED_OVERHEAD + 1] {
+         for drop in [true, false] {
+             let mut pair = Pair::default();
+             let mut client_config = client_config();
+@@ -2461,9 +2516,11 @@ fn datagram_send_buffer_metadata_boundaries() {
+             client_config.transport_config(transport_config.into());
+             let (client_ch, server_ch) = pair.connect_with(client_config);
+ 
+-            let Some(payload_capacity) = window.checked_sub(size_of::<Datagram>()) else {
++            let Some(payload_capacity) = window.checked_sub(QUEUED_OVERHEAD) else {
++                let now = pair.time;
+                 assert_matches!(
+-                    pair.client_datagrams(client_ch).send(Bytes::new(), drop),
++                    pair.client_datagrams(client_ch)
++                        .send(Bytes::new(), drop, now),
+                     Err(SendDatagramError::TooLarge)
+                 );
+                 continue;
+@@ -2471,12 +2528,17 @@ fn datagram_send_buffer_metadata_boundaries() {
+ 
+             // An exact fit succeeds, and rejecting a larger datagram preserves the queued one.
+             let data = Bytes::from(vec![0xAB; payload_capacity]);
++            let now = pair.time;
+             pair.client_datagrams(client_ch)
+-                .send(data.clone(), drop)
++                .send(data.clone(), drop, now)
+                 .unwrap();
++            let now = pair.time;
+             assert_matches!(
+-                pair.client_datagrams(client_ch)
+-                    .send(vec![0; payload_capacity + 1].into(), drop),
++                pair.client_datagrams(client_ch).send(
++                    vec![0; payload_capacity + 1].into(),
++                    drop,
++                    now
++                ),
+                 Err(SendDatagramError::TooLarge)
+             );
+             pair.drive();
+@@ -2493,18 +2555,21 @@ fn datagram_send_buffer_blocks_until_drained() {
+     let mut pair = Pair::default();
+     let mut client_config = client_config();
+     let mut transport_config = TransportConfig::default();
+-    transport_config.datagram_send_buffer_size(2 * (LEN + size_of::<Datagram>()));
++    transport_config.datagram_send_buffer_size(2 * (LEN + QUEUED_OVERHEAD));
+     client_config.transport_config(transport_config.into());
+     let (client_ch, server_ch) = pair.connect_with(client_config);
+ 
+     for i in 0..2u8 {
++        let now = pair.time;
+         pair.client_datagrams(client_ch)
+-            .send(vec![i; LEN].into(), false)
++            .send(vec![i; LEN].into(), false, now)
+             .unwrap();
+     }
+     let data = Bytes::from_static(&[2; LEN]);
++    let now = pair.time;
+     assert_eq!(
+-        pair.client_datagrams(client_ch).send(data.clone(), false),
++        pair.client_datagrams(client_ch)
++            .send(data.clone(), false, now),
+         Err(SendDatagramError::Blocked(data.clone()))
+     );
+     pair.drive();
+@@ -2516,8 +2581,9 @@ fn datagram_send_buffer_blocks_until_drained() {
+     }
+     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+ 
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(data.clone(), false)
++        .send(data.clone(), false, now)
+         .unwrap();
+     pair.drive();
+     assert_eq!(pair.server_datagrams(server_ch).recv(), Some(data));
+@@ -2539,7 +2605,11 @@ fn datagram_unsupported() {
+     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+     assert_matches!(pair.client_datagrams(client_ch).max_size(), None);
+ 
+-    match pair.client_datagrams(client_ch).send(Bytes::new(), true) {
++    let now = pair.time;
++    match pair
++        .client_datagrams(client_ch)
++        .send(Bytes::new(), true, now)
++    {
+         Err(SendDatagramError::UnsupportedByPeer) => {}
+         Err(e) => panic!("unexpected error: {e}"),
+         Ok(_) => panic!("unexpected success"),
+@@ -3637,8 +3707,9 @@ fn pure_sender_voluntarily_acks() {
+ 
+     for _ in 0..100 {
+         const MSG: &[u8] = b"hello";
++        let now = pair.time;
+         pair.client_datagrams(client_ch)
+-            .send(Bytes::from_static(MSG), true)
++            .send(Bytes::from_static(MSG), true, now)
+             .unwrap();
+         pair.drive();
+         assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), MSG);
+@@ -3768,8 +3839,9 @@ fn datagram_gso() {
+ 
+     // Sending ack-eliciting packet from server let client send ACK, which prevents
+     // sending bundled ACK for a while.
++    let now = pair.time;
+     pair.server_datagrams(server_ch)
+-        .send(Bytes::new(), false)
++        .send(Bytes::new(), false, now)
+         .unwrap();
+     pair.drive();
+ 
+@@ -3782,8 +3854,9 @@ fn datagram_gso() {
+     const DATAGRAM_LEN: usize = 1024;
+     const DATAGRAMS: usize = 10;
+     for _ in 0..DATAGRAMS {
++        let now = pair.time;
+         pair.client_datagrams(client_ch)
+-            .send(Bytes::from_static(&[0; DATAGRAM_LEN]), false)
++            .send(Bytes::from_static(&[0; DATAGRAM_LEN]), false, now)
+             .unwrap();
+     }
+     pair.drive();
+@@ -3810,9 +3883,10 @@ fn gso_truncation() {
+     // produce a QUIC packet of the same length as the first.
+     info!("sending");
+     const SIZES: [usize; 3] = [1024, 768, 768];
++    let now = pair.time;
+     for len in SIZES {
+         pair.client_datagrams(client_ch)
+-            .send(vec![0; len].into(), false)
++            .send(vec![0; len].into(), false, now)
+             .unwrap();
+     }
+     pair.drive();
+@@ -3855,11 +3929,12 @@ fn pad_to_mtu() {
+     // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
+     const LEN_1: usize = 800;
+     const LEN_2: usize = 600;
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(vec![0; LEN_1].into(), false)
++        .send(vec![0; LEN_1].into(), false, now)
+         .unwrap();
+     pair.client_datagrams(client_ch)
+-        .send(vec![0; LEN_2].into(), false)
++        .send(vec![0; LEN_2].into(), false, now)
+         .unwrap();
+     pair.client.drive(pair.time, pair.server.addr);
+ 
+@@ -3914,8 +3989,9 @@ fn large_datagram_with_acks() {
+ 
+     let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+     let msg = Bytes::from(vec![0; max_size]);
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(msg.clone(), true)
++        .send(msg.clone(), true, now)
+         .unwrap();
+     let initial_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+     pair.drive();
+@@ -3938,9 +4014,10 @@ fn voluntary_ack_with_large_datagrams() {
+     // larger ACKs occur
+     const COUNT: usize = 256;
+     for _ in 0..COUNT {
++        let now = pair.time;
+         let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+         pair.client_datagrams(client_ch)
+-            .send(vec![0; max_size].into(), true)
++            .send(vec![0; max_size].into(), true, now)
+             .unwrap();
+         pair.drive();
+     }
+@@ -3966,7 +4043,11 @@ fn path_changes_unblock_oversized_datagrams() {
+         let empty_space = pair.server_datagrams(server_ch).send_buffer_space();
+         let data = Bytes::from(vec![42; old_max]);
+         loop {
+-            match pair.server_datagrams(server_ch).send(data.clone(), false) {
++            let now = pair.time;
++            match pair
++                .server_datagrams(server_ch)
++                .send(data.clone(), false, now)
++            {
+                 Ok(()) => {}
+                 Err(SendDatagramError::Blocked(_)) => break,
+                 Err(error) => panic!("unexpected send error: {error}"),
+@@ -4013,8 +4094,9 @@ fn path_changes_unblock_oversized_datagrams() {
+         );
+ 
+         let small = Bytes::from_static(b"small");
++        let now = pair.time;
+         pair.server_datagrams(server_ch)
+-            .send(small.clone(), false)
++            .send(small.clone(), false, now)
+             .unwrap();
+         pair.drive();
+         assert_eq!(pair.client_datagrams(client_ch).recv(), Some(small));
+@@ -4043,9 +4125,10 @@ fn oversized_datagrams_trigger_unblock() {
+     let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+     let data = vec![0; max_size];
+     loop {
++        let now = pair.time;
+         match pair
+             .client_datagrams(client_ch)
+-            .send(data.clone().into(), false)
++            .send(data.clone().into(), false, now)
+         {
+             Ok(_) => {}
+             Err(SendDatagramError::Blocked(_)) => {
+@@ -4060,9 +4143,10 @@ fn oversized_datagrams_trigger_unblock() {
+     // Drive the pair until black hole detection kicks in and the path MTU is adjusted.
+     while pair.step() {
+         let err = loop {
++            let now = pair.time;
+             if let Err(e) = pair
+                 .client_datagrams(client_ch)
+-                .send(data.clone().into(), false)
++                .send(data.clone().into(), false, now)
+             {
+                 break e;
+             }
+@@ -4094,7 +4178,7 @@ fn oversized_datagrams_trigger_unblock() {
+ 
+     assert_eq!(
+         pair.client_datagrams(client_ch).send_buffer_space(),
+-        send_buffer_size - size_of::<Datagram>(),
++        send_buffer_size - QUEUED_OVERHEAD,
+         "expected the send buffer to be empty after too large datagrams were dropped",
+     );
+     match pair.client_conn_mut(client_ch).poll() {
+@@ -4110,8 +4194,9 @@ fn ack_bundled_with_datagrams() {
+     let (client_ch, server_ch) = pair.connect_with(client_config_with_deterministic_pns());
+ 
+     // Send packet from client and then send from server. the packet from server should include ACKs
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(vec![0; 1].into(), false)
++        .send(vec![0; 1].into(), false, now)
+         .unwrap();
+     pair.drive_client();
+     pair.drive_server();
+@@ -4120,8 +4205,9 @@ fn ack_bundled_with_datagrams() {
+     let server_tx_packets_before_datagram =
+         pair.server_conn_mut(server_ch).stats().udp_tx.datagrams;
+ 
++    let now = pair.time;
+     pair.server_datagrams(server_ch)
+-        .send(vec![0; 1].into(), false)
++        .send(vec![0; 1].into(), false, now)
+         .unwrap();
+     pair.drive_server();
+ 
 diff --git a/quinn/src/connection.rs b/quinn/src/connection.rs
-index 44d3b4dd..9247717e 100644
+index 82a3171c..69b59203 100644
 --- a/quinn/src/connection.rs
 +++ b/quinn/src/connection.rs
 @@ -28,8 +28,8 @@ use crate::{
@@ -1463,10 +2344,25 @@ index 44d3b4dd..9247717e 100644
  };
  
  /// In-progress connection attempt future
-@@ -453,6 +453,42 @@ impl Connection {
+@@ -451,7 +451,43 @@ impl Connection {
+             return Err(SendDatagramError::ConnectionLost(x.clone()));
          }
-     }
- 
+         use proto::SendDatagramError::*;
+-        match conn.inner.datagrams().send(data, true) {
++        match conn.inner.datagrams().send(data, true, Instant::now()) {
++            Ok(()) => {
++                conn.wake();
++                Ok(())
++            }
++            Err(e) => Err(match e {
++                Blocked(..) => unreachable!(),
++                UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
++                Disabled => SendDatagramError::Disabled,
++                TooLarge => SendDatagramError::TooLarge,
++            }),
++        }
++    }
++
 +    /// [`send_datagram()`] with a caller-supplied [`DatagramClass`]
 +    ///
 +    /// The classification (inner-packet ECN codepoint and flow key, computed
@@ -1490,34 +2386,30 @@ index 44d3b4dd..9247717e 100644
 +            .datagrams()
 +            .send_classified(data, true, Instant::now(), class)
 +        {
-+            Ok(()) => {
-+                conn.wake();
-+                Ok(())
-+            }
-+            Err(e) => Err(match e {
-+                Blocked(..) => unreachable!(),
-+                UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
-+                Disabled => SendDatagramError::Disabled,
-+                TooLarge => SendDatagramError::TooLarge,
-+            }),
-+        }
-+    }
-+
-     /// Transmit `data` as an unreliable, unordered application datagram
-     ///
-     /// Unlike [`send_datagram()`], this method will wait for buffer space during congestion
+             Ok(()) => {
+                 conn.wake();
+                 Ok(())
+@@ -863,7 +899,7 @@ impl Future for SendDatagram<'_> {
+         match state
+             .inner
+             .datagrams()
+-            .send(this.data.take().unwrap(), false)
++            .send(this.data.take().unwrap(), false, Instant::now())
+         {
+             Ok(()) => {
+                 state.wake();
 diff --git a/quinn/src/lib.rs b/quinn/src/lib.rs
-index 573075e5..a7759cf4 100644
+index 82becdb1..a7759cf4 100644
 --- a/quinn/src/lib.rs
 +++ b/quinn/src/lib.rs
 @@ -62,11 +62,12 @@ pub use proto::BloomTokenLog;
  pub use proto::{
      AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
      ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
--    ConnectionStats, DatagramAqmConfig, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType,
--    IdleTimeout, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side,
--    StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore,
--    Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
+-    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
+-    MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
+-    StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
+-    TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
 -    VarIntBoundsExceeded, Written, congestion, crypto,
 +    ConnectionStats, DatagramAqmConfig, DatagramBdpBufferConfig, DatagramClass, DatagramEcn, Dir,
 +    EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout, MtuDiscoveryConfig,

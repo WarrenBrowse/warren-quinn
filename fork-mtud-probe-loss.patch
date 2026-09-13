@@ -1,19 +1,21 @@
-From 181cd0a8237ce80839fa663230e43434a23fb64c Mon Sep 17 00:00:00 2001
-From: poka <poka@p2p.legal>
-Date: Sun, 13 Sep 2026 01:39:58 +0200
-Subject: [PATCH] fix(mtud): a probe lost while the path drops ordinary packets
- does not narrow the search
-
----
- quinn-proto/src/connection/mod.rs  |   6 +-
- quinn-proto/src/connection/mtud.rs | 161 +++++++++++++++++++++++++++--
- 2 files changed, 160 insertions(+), 7 deletions(-)
-
+diff --git a/quinn-proto/Cargo.toml b/quinn-proto/Cargo.toml
+index 184807cd..b99a44f7 100644
+--- a/quinn-proto/Cargo.toml
++++ b/quinn-proto/Cargo.toml
+@@ -5,7 +5,7 @@ name = "warren-quinn-proto"
+ # the three crates on every fork-side patch so a stale `Cargo.lock` cannot
+ # silently drag the upstream crate back in. Base: upstream quinn-proto 0.11.17
+ # (branch 0.11.x).
+-version = "0.11.17-fork.12"
++version = "0.11.17-fork.13"
+ edition.workspace = true
+ rust-version.workspace = true
+ license.workspace = true
 diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
-index 7f3f3a34..a3f1941e 100644
+index 9f102abc..53f76750 100644
 --- a/quinn-proto/src/connection/mod.rs
 +++ b/quinn-proto/src/connection/mod.rs
-@@ -1815,7 +1815,11 @@ impl Connection {
+@@ -1851,7 +1851,11 @@ impl Connection {
          if let Some(packet) = lost_mtu_probe {
              let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
              self.remove_in_flight(&info);
@@ -27,10 +29,10 @@ index 7f3f3a34..a3f1941e 100644
          }
      }
 diff --git a/quinn-proto/src/connection/mtud.rs b/quinn-proto/src/connection/mtud.rs
-index b690731b..03939c28 100644
+index 0893b294..73adcda2 100644
 --- a/quinn-proto/src/connection/mtud.rs
 +++ b/quinn-proto/src/connection/mtud.rs
-@@ -128,9 +128,15 @@ impl MtuDiscovery {
+@@ -133,9 +133,15 @@ impl MtuDiscovery {
      }
  
      /// Notifies the [`MtuDiscovery`] that the in-flight MTU probe was lost
@@ -48,7 +50,7 @@ index b690731b..03939c28 100644
          }
      }
  
-@@ -250,9 +256,26 @@ impl EnabledMtuDiscovery {
+@@ -255,9 +261,26 @@ impl EnabledMtuDiscovery {
      }
  
      /// Called when the in-flight MTU probe was lost
@@ -76,7 +78,7 @@ index b690731b..03939c28 100644
              state.in_flight_probe = None;
              state.lost_probe_count += 1;
          }
-@@ -554,7 +577,7 @@ mod tests {
+@@ -566,7 +589,7 @@ mod tests {
              if probe_size <= link_payload_size_limit {
                  mtud.on_acked(SpaceId::Data, probe_pn, probe_size);
              } else {
@@ -85,7 +87,7 @@ index b690731b..03939c28 100644
              }
          }
          probed_sizes
-@@ -587,6 +610,132 @@ mod tests {
+@@ -599,6 +622,132 @@ mod tests {
          assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 1);
      }
  
@@ -218,7 +220,7 @@ index b690731b..03939c28 100644
      #[test]
      fn black_hole_detector_ignores_empty_burst() {
          let mut mtud = default_mtud();
-@@ -684,7 +833,7 @@ mod tests {
+@@ -696,7 +845,7 @@ mod tests {
              let probe_size = mtud.poll_transmit(Instant::now(), i);
              assert!(probe_size.is_some(), "no probe returned for packet {i}");
  
@@ -227,7 +229,7 @@ index b690731b..03939c28 100644
              probe_size.unwrap()
          });
  
-@@ -819,7 +968,7 @@ mod tests {
+@@ -835,7 +984,7 @@ mod tests {
                  );
                  // assert!(mtud.current_mtu > previous_max_size);
              } else {
@@ -236,6 +238,45 @@ index b690731b..03939c28 100644
              }
          }
  
--- 
-2.50.1 (Apple Git-155)
-
+diff --git a/quinn-udp/Cargo.toml b/quinn-udp/Cargo.toml
+index 2609b2bc..fb20736b 100644
+--- a/quinn-udp/Cargo.toml
++++ b/quinn-udp/Cargo.toml
+@@ -2,7 +2,7 @@
+ name = "warren-quinn-udp"
+ # Same repo-wide `-fork.<N>` level as the sibling crates. Base: upstream
+ # quinn-udp 0.6.1 (tag `quinn-udp-0.6.1`, main lineage).
+-version = "0.6.1-fork.12"
++version = "0.6.1-fork.13"
+ edition.workspace = true
+ rust-version.workspace = true
+ license.workspace = true
+diff --git a/quinn/Cargo.toml b/quinn/Cargo.toml
+index 306323f0..5730be32 100644
+--- a/quinn/Cargo.toml
++++ b/quinn/Cargo.toml
+@@ -3,7 +3,7 @@ name = "warren-quinn"
+ # Same `<upstream-base>-fork.<N>` scheme as warren-quinn-proto, bumped in
+ # lockstep so the manifest reflects the repo-wide fork level. Upstream base:
+ # quinn 0.11.11 (tag `quinn-0.11.11`, on branch 0.11.x).
+-version = "0.11.11-fork.12"
++version = "0.11.11-fork.13"
+ license.workspace = true
+ repository.workspace = true
+ description = "Versatile QUIC transport protocol implementation"
+@@ -65,13 +65,13 @@ bytes = { workspace = true }
+ futures-io = { workspace = true, optional = true }
+ rustc-hash = { workspace = true }
+ pin-project-lite = { workspace = true }
+-proto = { package = "warren-quinn-proto", path = "../quinn-proto", version = "0.11.17-fork.12", default-features = false }
++proto = { package = "warren-quinn-proto", path = "../quinn-proto", version = "0.11.17-fork.13", default-features = false }
+ rustls = { workspace = true, optional = true }
+ smol = { workspace = true, optional = true }
+ thiserror = { workspace = true }
+ tracing =  { workspace = true }
+ tokio = { workspace = true }
+-udp = { package = "warren-quinn-udp", path = "../quinn-udp", version = "0.6.1-fork.12", default-features = false, features = ["tracing"] }
++udp = { package = "warren-quinn-udp", path = "../quinn-udp", version = "0.6.1-fork.13", default-features = false, features = ["tracing"] }
+ 
+ [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+ socket2 = { workspace = true }

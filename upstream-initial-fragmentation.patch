@@ -1,5 +1,5 @@
 diff --git a/quinn-proto/src/config/transport.rs b/quinn-proto/src/config/transport.rs
-index 0198e450..5bec0847 100644
+index 322f7382..0220982f 100644
 --- a/quinn-proto/src/config/transport.rs
 +++ b/quinn-proto/src/config/transport.rs
 @@ -8,8 +8,8 @@ use qlog::streamer::QlogStreamer;
@@ -76,7 +76,7 @@ index 0198e450..5bec0847 100644
      /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
      ///
      /// The provided configuration will be ignored if the peer does not support the acknowledgement
-@@ -375,6 +424,10 @@ impl Default for TransportConfig {
+@@ -379,6 +428,10 @@ impl Default for TransportConfig {
              min_mtu: INITIAL_MTU,
              mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
              pad_to_mtu: false,
@@ -87,7 +87,7 @@ index 0198e450..5bec0847 100644
              ack_frequency_config: None,
  
              persistent_congestion_threshold: 3,
-@@ -412,6 +465,8 @@ impl fmt::Debug for TransportConfig {
+@@ -416,6 +469,8 @@ impl fmt::Debug for TransportConfig {
              min_mtu,
              mtu_discovery_config,
              pad_to_mtu,
@@ -96,7 +96,7 @@ index 0198e450..5bec0847 100644
              ack_frequency_config,
              persistent_congestion_threshold,
              keep_alive_interval,
-@@ -441,6 +496,11 @@ impl fmt::Debug for TransportConfig {
+@@ -445,6 +500,11 @@ impl fmt::Debug for TransportConfig {
              .field("min_mtu", min_mtu)
              .field("mtu_discovery_config", mtu_discovery_config)
              .field("pad_to_mtu", pad_to_mtu)
@@ -109,10 +109,10 @@ index 0198e450..5bec0847 100644
              .field(
                  "persistent_congestion_threshold",
 diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
-index cd0d1ccb..94fc2ee7 100644
+index 05a43857..6aa2a82b 100644
 --- a/quinn-proto/src/connection/mod.rs
 +++ b/quinn-proto/src/connection/mod.rs
-@@ -522,7 +522,7 @@ impl Connection {
+@@ -530,7 +530,7 @@ impl Connection {
          let spaces = [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data];
          // This loop will potentially spend multiple iterations in the same `SpaceId`,
          // so we cannot trivially rewrite it to take advantage of `SpaceId::iter()`.
@@ -121,7 +121,7 @@ index cd0d1ccb..94fc2ee7 100644
              let space_id = spaces[space_idx];
              // Number of bytes available for frames if this is a 1-RTT packet. We're guaranteed to
              // be able to send an individual frame at least this large in the next 1-RTT
-@@ -633,7 +633,17 @@ impl Connection {
+@@ -641,7 +641,17 @@ impl Connection {
                  // Finish current packet
                  if let Some(mut builder) = builder_storage.take() {
                      if pad_datagram {
@@ -140,8 +140,8 @@ index cd0d1ccb..94fc2ee7 100644
                      }
  
                      if num_datagrams > 1 || pad_datagram_to_mtu {
-@@ -901,9 +911,21 @@ impl Connection {
-                 self.timers.stop(Timer::MaxAckDelay);
+@@ -911,9 +921,21 @@ impl Connection {
+                 self.next_bundled_ack_time = Some(now + self.next_bundled_ack_delay());
              }
  
 +            // If `populate_packet` truncated the first Initial CRYPTO
@@ -162,7 +162,7 @@ index cd0d1ccb..94fc2ee7 100644
              // Don't increment space_idx.
              // We stay in the current space and check if there is more data to send.
          }
-@@ -911,7 +933,14 @@ impl Connection {
+@@ -921,7 +943,14 @@ impl Connection {
          // Finish the last packet
          if let Some(mut builder) = builder_storage {
              if pad_datagram {
@@ -178,7 +178,7 @@ index cd0d1ccb..94fc2ee7 100644
              }
  
              // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
-@@ -3257,11 +3286,40 @@ impl Connection {
+@@ -3280,11 +3309,40 @@ impl Connection {
                  - VarInt::size(unsafe { VarInt::from_u64_unchecked(frame.offset) })
                  - 2; // Maximum encoded length for frame size, given we send less than 2^14 bytes
  
@@ -220,7 +220,7 @@ index cd0d1ccb..94fc2ee7 100644
  
              let data = frame.data.split_to(len);
              let truncated = frame::Crypto {
-@@ -3276,10 +3334,19 @@ impl Connection {
+@@ -3299,10 +3357,19 @@ impl Connection {
              truncated.encode(buf);
              self.stats.frame_tx.crypto += 1;
              sent.retransmits.get_or_create().crypto.push_back(truncated);
@@ -241,7 +241,7 @@ index cd0d1ccb..94fc2ee7 100644
          }
  
          if space_id == SpaceId::Data {
-@@ -4035,6 +4102,12 @@ struct SentFrames {
+@@ -4085,6 +4152,12 @@ struct SentFrames {
      /// Whether the packet contains non-retransmittable frames (like datagrams)
      non_retransmits: bool,
      requires_padding: bool,
@@ -255,10 +255,10 @@ index cd0d1ccb..94fc2ee7 100644
  
  impl SentFrames {
 diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
-index b39b332e..3c90cd2d 100644
+index 1c24d34a..6aa2d45c 100644
 --- a/quinn-proto/src/tests/mod.rs
 +++ b/quinn-proto/src/tests/mod.rs
-@@ -3398,3 +3398,233 @@ fn preferred_address() {
+@@ -4180,3 +4180,233 @@ fn preferred_address() {
      let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
      pair.connect();
  }
