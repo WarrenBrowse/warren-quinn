@@ -264,11 +264,13 @@ impl EnabledMtuDiscovery {
     ///
     /// `path_lossy` means ordinary packets were declared lost in the same
     /// detection pass, so the path is dropping traffic of every size and the
-    /// probe's loss carries no information about the probed size. Counting it
-    /// as a failure anyway is what RFC 8899 warns against: the binary search
-    /// lowers its upper bound on every congestion drop and converges far below
-    /// the real PMTU, while retransmitting the probe for as long as the link
-    /// stays congested.
+    /// probe's loss carries no information about the probed size. RFC 8899
+    /// section 3, requirement 4: "The PL is REQUIRED to be robust in the case
+    /// where probe packets are lost due to other reasons (including link
+    /// transmission error, congestion)." Counting such a loss as a failure
+    /// anyway lowers the binary search's upper bound on every congestion drop,
+    /// so it converges below the real PMTU while retransmitting the probe for
+    /// as long as the link stays congested.
     ///
     /// The round is therefore ENDED with the MTU left exactly where it was, to
     /// be retried at the next activation. Ending it rather than re-probing is

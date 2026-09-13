@@ -179,8 +179,9 @@ old tags are unaffected; only `main` was rebuilt.
    retried at the next activation; ending it rather than re-probing is what
    keeps a permanently lossy link from reproducing the probe storm. A path that
    only loses the probe, which is what a real MTU ceiling looks like, is
-   unaffected and still narrows the search. RFC 8899 sect 4.1 is explicit that
-   a PL loss not attributable to probe size must not shrink the search.
+   unaffected and still narrows the search. RFC 8899 sect 3, requirement 4:
+   "The PL is REQUIRED to be robust in the case where probe packets are lost
+   due to other reasons (including link transmission error, congestion)".
    Covered by `connection::mtud::tests`
    (`a_probe_lost_while_the_path_drops_ordinary_packets_does_not_narrow_the_search`,
    `a_probe_lost_on_an_otherwise_healthy_path_still_narrows_the_search`).
@@ -192,6 +193,40 @@ old tags are unaffected; only `main` was rebuilt.
    two were told apart. The delta has no A/B bench of its own yet, because the
    local narrow-link harness never reproduced the search-bound walk
    (`warren-core/bench/results/2026-09-13_lastmile_local-container_mtu-probe-loss.md`).
+
+   **Checked against quiche** (cloudflare/quiche `c8da372`, `quiche/src/pmtud.rs`
+   and the call sites in `path.rs` / `lib.rs`), because a delta the other major
+   QUIC implementation does not need is a delta worth doubting:
+
+   - quiche does **not** discriminate either. `Pmtud::failed_probe` is called
+     from the lost-frame handler for a `Ping { mtu_probe }` with no notion of
+     whether ordinary packets were lost in the same pass, and after
+     `max_probes` (3) consecutive failures it records
+     `smallest_failed_probe_size` and binary-searches down. The gap this delta
+     closes is common to both implementations, not a quinn quirk.
+   - quiche **gates the probe on the congestion window**:
+     `Path::should_send_pmtu_probe` requires
+     `recovery.cwnd_available() > pmtud.get_probe_size()` and an otherwise
+     empty frame set. quinn sends the probe whenever the send buffer is empty
+     and the connection is established, with no window check and no
+     `congestion.on_sent` accounting, so a collapsed cwnd does not slow probing
+     down at all. RFC 8899 section 3, requirement 7 permits either ("A PL MAY
+     use a congestion controller to decide when to send a probe packet"). This
+     is a real second lever and it is deliberately NOT taken here: delta 9
+     already prevents the harmful consequence, and a thin fork does not carry
+     two overlapping unbenched behaviour changes. Revisit it if the bench ever
+     reproduces the search-bound walk with delta 9 in place.
+   - quiche has **no black-hole detector**. Its operating MTU is
+     `largest_successful_probe_size`, which only moves on PROBE outcomes, so
+     the class of bug upstream quinn fixed in `dcb9eabe` (ordinary full-size
+     loss bursts pinning the connection at `min_mtu`) cannot occur there. That
+     is independent corroboration that the detector, not the search, was what
+     pinned the field connection at 1200.
+   - The cost of quiche's design is the other way round: once `pmtu` is set it
+     never searches upward again, and `revalidate_pmtu()` re-probes the same
+     size and is left to the application to call. quinn re-searches on its own
+     every `interval` (600 s by default), so a PMTU that settled too low
+     recovers without help.
 
 ## Patch files (portable form of the deltas)
 
