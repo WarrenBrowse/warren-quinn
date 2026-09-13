@@ -491,6 +491,17 @@ impl Controller for Bbr {
         self.cwnd
     }
 
+    fn bdp_estimate(&self) -> Option<u64> {
+        // The raw model product, deliberately without cwnd_gain or the
+        // ack-aggregation term: those inflate cwnd for probing, while buffer
+        // sizing wants the path's actual capacity.
+        let bw = self.max_bandwidth.get_estimate();
+        if bw == 0 || self.min_rtt.is_zero() {
+            return None;
+        }
+        Some(self.min_rtt.as_micros() as u64 * bw / 1_000_000)
+    }
+
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
@@ -781,6 +792,42 @@ mod tests {
             bbr.cwnd,
             bbr.acked_bytes,
             bbr.init_cwnd
+        );
+    }
+
+    #[test]
+    fn bdp_estimate_tracks_bandwidth_times_min_rtt() {
+        let mut now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        assert_eq!(
+            bbr.bdp_estimate(),
+            None,
+            "no estimate before any bandwidth sample"
+        );
+        bbr.probe_rtt_last_started_at = Some(now);
+        bbr.min_rtt = Duration::from_millis(20);
+        let rtt = RttEstimator::new(Duration::from_millis(20));
+        let mut pn = 0u64;
+
+        // A paced stream: 1200 B every 600 us = 2 MB/s sample rate.
+        for _ in 0..8 {
+            now = run_round(
+                &mut bbr,
+                &rtt,
+                now,
+                &mut pn,
+                33,
+                1200,
+                Duration::from_micros(600),
+                false,
+            );
+        }
+        let bdp = bbr.bdp_estimate().expect("samples must yield an estimate");
+        // 2 MB/s x 20 ms = 40 KB; accept generous slack for the windowed
+        // max filter's sampling artifacts.
+        assert!(
+            (20_000..160_000).contains(&bdp),
+            "estimate must be near bw x min_rtt, got {bdp}"
         );
     }
 
