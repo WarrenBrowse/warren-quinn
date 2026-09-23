@@ -24,6 +24,9 @@ concurrency:
 jobs:
   checks:
     name: fmt + check + fork delta
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 25
     steps:
