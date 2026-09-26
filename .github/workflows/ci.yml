@@ -1,7 +1,7 @@
 name: CI
 
-# Runs on the WarrenBrowse org self-hosted arm64 fleet, like every other Warren
-# verification job. Deliberately narrow: this is a THIN fork, so CI answers two
+# Runs on GitHub-hosted runners (free and unlimited for a public repo, and
+# faster than the self-hosted pools were). Deliberately narrow: this is a THIN fork, so CI answers two
 # questions only, "does it still build" and "is the Warren delta still there".
 # Upstream quinn's own test suite stays upstream's job; duplicating it here would
 # make every re-sync rebase a CI archaeology exercise.
@@ -24,10 +24,10 @@ concurrency:
 jobs:
   checks:
     name: fmt + check + fork delta
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job, a guard kept from the self-hosted
+    # era.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
