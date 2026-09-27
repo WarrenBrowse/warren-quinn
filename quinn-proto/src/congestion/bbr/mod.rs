@@ -523,11 +523,17 @@ impl Controller for Bbr {
         // The raw model product, deliberately without cwnd_gain or the
         // ack-aggregation term: those inflate cwnd for probing, while buffer
         // sizing wants the path's actual capacity.
+        //
+        // The round trip is taken as at least `K_BDP_MIN_ROUND_TRIP`: sized on a
+        // sub-millisecond path, the buffer holds less than one scheduling hiccup of the
+        // sender feeding it, and the datagrams that hiccup brings are dropped for want
+        // of room rather than for any queue the path built.
         let bw = self.max_bandwidth.get_estimate();
         if bw == 0 || self.min_rtt.is_zero() {
             return None;
         }
-        Some(self.min_rtt.as_micros() as u64 * bw / 1_000_000)
+        let round_trip = self.min_rtt.max(K_BDP_MIN_ROUND_TRIP);
+        Some(round_trip.as_micros() as u64 * bw / 1_000_000)
     }
 
     fn metrics(&self) -> ControllerMetrics {
@@ -688,6 +694,14 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 /// How long a `min_rtt` estimate stands before the current RTT sample replaces it
 const K_MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
+
+/// The shortest round trip [`Bbr::bdp_estimate`] sizes a send buffer over.
+///
+/// With the BDP-adaptive datagram buffer's default multiple of 4 this keeps at least
+/// 20 ms of the path's rate queueable, above the datagram AQM's 15 ms CoDel target, so
+/// on a fast, short path the AQM rather than the buffer's byte limit decides what is
+/// dropped. Paths with a longer round trip are unaffected.
+const K_BDP_MIN_ROUND_TRIP: Duration = Duration::from_millis(5);
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
@@ -930,6 +944,37 @@ mod tests {
         assert!(
             (20_000..160_000).contains(&bdp),
             "estimate must be near bw x min_rtt, got {bdp}"
+        );
+    }
+
+    #[test]
+    fn bdp_estimate_covers_at_least_the_minimum_buffer_round_trip() {
+        let mut now = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.probe_rtt_last_started_at = Some(now);
+        let rtt = RttEstimator::new(Duration::from_micros(300));
+        let mut pn = 0u64;
+        // The same 2 MB/s paced stream, on a 300 us path.
+        for _ in 0..8 {
+            now = run_round(
+                &mut bbr,
+                &rtt,
+                now,
+                &mut pn,
+                33,
+                1200,
+                Duration::from_micros(600),
+                false,
+            );
+        }
+        bbr.min_rtt = Duration::from_micros(300);
+        let bdp = bbr.bdp_estimate().expect("samples must yield an estimate");
+        // 2 MB/s x 300 us would be 600 B, a buffer a single scheduling hiccup of the
+        // sender overflows; the estimate is taken over K_BDP_MIN_ROUND_TRIP instead.
+        assert!(
+            (5_000..40_000).contains(&bdp),
+            "a sub-millisecond path must still size the buffer over K_BDP_MIN_ROUND_TRIP \
+             (2 MB/s x 5 ms = 10 KB), got {bdp}"
         );
     }
 
