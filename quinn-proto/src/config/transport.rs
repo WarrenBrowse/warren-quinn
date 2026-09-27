@@ -905,6 +905,12 @@ impl DatagramAqmConfig {
         self.flow_queues = value.max(1);
         self
     }
+
+    /// Accepted and ignored: this bench arm keeps the fork.13 scheduler, which has no
+    /// reorder bound, while compiling against an engine that sets one.
+    pub fn max_reorder(&mut self, _value: Option<u64>) -> &mut Self {
+        self
+    }
 }
 
 impl Default for DatagramAqmConfig {
