@@ -48,6 +48,8 @@ pub struct Bbr {
     min_rtt: Duration,
     /// The smallest RTT sample among the packets of the ACK being processed
     ack_min_rtt: Option<Duration>,
+    /// The smallest RTT sample since `min_rtt` was last renewed
+    window_min_rtt: Option<Duration>,
     exiting_quiescence: bool,
     pacing_rate: u64,
     max_acked_packet_number: u64,
@@ -90,6 +92,7 @@ impl Bbr {
             probe_rtt_last_started_at: None,
             min_rtt: Default::default(),
             ack_min_rtt: None,
+            window_min_rtt: None,
             exiting_quiescence: false,
             pacing_rate: 0,
             max_acked_packet_number: 0,
@@ -215,17 +218,25 @@ impl Bbr {
 
     /// Folds the ACK's RTT sample into `min_rtt`.
     ///
-    /// When the estimate expires, on the port's ProbeRtt schedule, it takes the path's
-    /// current round trip, and any smaller sample lowers it in between. The port used to
-    /// read `RttEstimator::min()` in both places, the connection's lifetime minimum: an
-    /// expiry then re-read the old value, so a path whose RTT rose after the handshake
-    /// kept the old path's round trip in `bw x min_rtt` for good, and its window with it.
-    /// The first estimate is still taken on the first expiry, so a connection that has
-    /// never filled its window keeps none, as before.
+    /// When the estimate expires, on the port's ProbeRtt schedule, it takes the smallest
+    /// sample seen since the previous renewal, and any smaller sample lowers it in
+    /// between. The port used to read `RttEstimator::min()` in both places, the
+    /// connection's lifetime minimum: an expiry then re-read the old value, so a path
+    /// whose RTT rose after the handshake kept the old path's round trip in
+    /// `bw x min_rtt` for good, and its window with it. Renewing from the window's
+    /// minimum rather than the sample at hand keeps a standing queue out of the
+    /// estimate: one moment of drain in the window is enough. The first estimate is
+    /// still taken on the first expiry, so a connection that has never filled its window
+    /// keeps none, as before.
     fn update_min_rtt(&mut self, now: Instant, sample: Duration, app_limited: bool) {
-        if self.is_min_rtt_expired(now, app_limited)
-            || (!self.min_rtt.is_zero() && sample < self.min_rtt)
-        {
+        let window_min = self.window_min_rtt.map_or(sample, |min| min.min(sample));
+        if self.is_min_rtt_expired(now, app_limited) {
+            self.min_rtt = window_min;
+            self.window_min_rtt = None;
+            return;
+        }
+        self.window_min_rtt = Some(window_min);
+        if !self.min_rtt.is_zero() && sample < self.min_rtt {
             self.min_rtt = sample;
         }
     }
@@ -797,6 +808,36 @@ mod tests {
             false,
         );
         assert_eq!(bbr.min_rtt, Duration::from_millis(30));
+    }
+
+    #[test]
+    fn a_renewed_min_rtt_is_the_smallest_sample_of_the_window() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(1));
+        let mut pn = 0u64;
+        let first_ack = start + Duration::from_millis(1);
+        ack_one(&mut bbr, &rtt, &mut pn, start, first_ack, false);
+
+        // The path now takes 40 ms, behind a standing queue that drains only now and
+        // then: most samples read 60 ms.
+        let mut now = start;
+        let mut i = 0u32;
+        while now < start + Duration::from_millis(9_900) {
+            now += Duration::from_millis(100);
+            i += 1;
+            let rtt_ms = if i % 20 == 0 { 40 } else { 60 };
+            let acked = now + Duration::from_millis(rtt_ms);
+            ack_one(&mut bbr, &rtt, &mut pn, now, acked, false);
+        }
+        now = start + Duration::from_millis(10_100);
+        let acked = now + Duration::from_millis(60);
+        ack_one(&mut bbr, &rtt, &mut pn, now, acked, false);
+        assert_eq!(
+            bbr.min_rtt,
+            Duration::from_millis(40),
+            "a renewal must take the path's floor over the window, not the queue at hand"
+        );
     }
 
     #[test]
