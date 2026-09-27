@@ -680,8 +680,9 @@ impl DatagramState {
     /// The AQM's `max_reorder` bounds the reordering DRR introduces: when
     /// the scheduled flow's head would leave an older datagram that far
     /// behind the newest one sent, the oldest queued datagram is served
-    /// first, charged to its own flow's DRR credit, or dropped when it has
-    /// already waited past the AQM target.
+    /// first, charged to its own flow's DRR credit. It is dropped instead
+    /// when it has already waited past the AQM target and its flow holds at
+    /// least as much backlog as the one DRR picked.
     pub(super) fn write(
         &mut self,
         buf: &mut Vec<u8>,
@@ -739,6 +740,13 @@ impl DatagramState {
                 .and_then(|config| config.max_reorder)
                 .and_then(|max_reorder| self.reorder_override(head, max_reorder))
                 .unwrap_or(bucket);
+            // Only the flow holding at least as much backlog as the one DRR
+            // picked may lose its stale head to the bound: a thin flow left
+            // oldest (its elders were evicted from a bulk flow, or the sender
+            // stalled) is sent out of turn instead, never made the victim.
+            let forced_is_fatter = served != bucket
+                && self.flows.get(&served).map(|f| f.bytes)
+                    >= self.flows.get(&bucket).map(|f| f.bytes);
             let flow = self
                 .flows
                 .get_mut(&served)
@@ -750,12 +758,12 @@ impl DatagramState {
 
             if let Some(config) = aqm {
                 let sojourn = now.saturating_duration_since(queued.queued_at);
-                // A datagram served out of turn delays the flow the scheduler
-                // picked. Once it has waited past the latency target it is
-                // stale by the AQM's own standard, and sending it would push
-                // that flow over target too, where its own CoDel punishes it
-                // for a backlog it did not build: drop it instead.
-                if served != bucket && sojourn >= config.target {
+                // A backlog served out of turn delays the flow the scheduler
+                // picked. Once its head has waited past the latency target it
+                // is stale by the AQM's own standard, and sending it would
+                // push that flow over target too, where its own CoDel punishes
+                // it for a backlog it did not build: drop it instead.
+                if forced_is_fatter && sojourn >= config.target {
                     self.outgoing_total -= queued.datagram.data.len();
                     self.outgoing_count -= 1;
                     flow.bytes -= queued.datagram.data.len();
@@ -1705,6 +1713,35 @@ mod tests {
             order[13..].windows(2).all(|w| w[0] < w[1]) && order[13] == backlog - bound + 1,
             "exactly the datagrams outside the bound were dropped"
         );
+    }
+
+    #[test]
+    fn a_thin_flow_left_oldest_by_overflow_is_sent_not_dropped() {
+        // The sender stalled while a bulk flow overran the buffer: overflow
+        // eviction removed the bulk flow's oldest datagrams, which leaves a
+        // sparse flow's datagram the oldest queued, past the AQM target, and
+        // behind a bulk head the bound forbids sending first. Dropping it
+        // would make the sparse flow pay for the bulk flow's overload (on a
+        // tunnel that is the path-health probe, and the link gets declared
+        // wedged): it is sent out of turn instead.
+        let config = aqm();
+        let mut state = DatagramState::default();
+        let mut stats = DatagramTxStats::default();
+        let start = Instant::now();
+        push_ordinal(&mut state, 1, 0, 1200, start);
+        push_ordinal(&mut state, 2, 1, 100, start);
+        for ordinal in 2..802 {
+            push_ordinal(&mut state, 1, ordinal, 1200, start);
+        }
+        for _ in 0..770 {
+            assert_eq!(state.evict_from_fattest_flow(), Some(1200));
+        }
+        let late = start + config.target * 2;
+        let mut buf = Vec::new();
+        assert!(state.write(&mut buf, usize::MAX, late, Some(&config), &mut stats));
+        assert_eq!(sent_ordinal(&buf), 1, "the sparse datagram goes out first");
+        assert_eq!(stats.dropped_reorder, 0, "a thin flow is never the victim");
+        assert_eq!(stats.reorder_forced, 1);
     }
 
     #[test]
