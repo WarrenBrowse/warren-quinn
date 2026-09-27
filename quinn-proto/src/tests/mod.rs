@@ -2481,6 +2481,57 @@ fn datagram_send_buffer_space_preserves_queued_datagrams() {
 }
 
 #[test]
+fn datagram_send_buffer_space_counts_the_reorder_bound_slots() {
+    // With several flows queued, a datagram enqueued behind `max_reorder`
+    // others can force older ones out of the queue (sent out of turn or
+    // dropped), so the advertised space must shrink to the free slots. A
+    // caller that backs off on low space (a tunnel's reader-side tail-drop)
+    // otherwise keeps sealing datagrams the queue is about to discard.
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut aqm = crate::DatagramAqmConfig::default();
+    aqm.max_reorder(Some(64));
+    let mut transport_config = TransportConfig::default();
+    transport_config.datagram_send_aqm(Some(aqm));
+    transport_config.datagram_send_buffer_size(16 * 1024 * 1024);
+    let mut client_config = client_config();
+    client_config.transport_config(transport_config.into());
+    let (client_ch, _) = pair.connect_with(client_config);
+    let max = pair.client_datagrams(client_ch).max_size().unwrap();
+    let flow = |f| DatagramClass {
+        flow: Some(f),
+        ecn: None,
+    };
+    let now = pair.time;
+
+    for _ in 0..60 {
+        pair.client_datagrams(client_ch)
+            .send_classified(vec![1; 100].into(), true, now, flow(1))
+            .unwrap();
+    }
+    let single = pair.client_datagrams(client_ch).send_buffer_space();
+    assert!(
+        single > 1024 * 1024,
+        "one flow cannot be reordered: the byte budget alone applies, got {single}"
+    );
+
+    pair.client_datagrams(client_ch)
+        .send_classified(vec![2; 100].into(), true, now, flow(2))
+        .unwrap();
+    assert_eq!(
+        pair.client_datagrams(client_ch).send_buffer_space(),
+        3 * max,
+        "61 of 64 slots used: three datagrams of the largest size remain"
+    );
+    for _ in 0..3 {
+        pair.client_datagrams(client_ch)
+            .send_classified(vec![1; 100].into(), true, now, flow(1))
+            .unwrap();
+    }
+    assert_eq!(pair.client_datagrams(client_ch).send_buffer_space(), 0);
+}
+
+#[test]
 fn datagram_larger_than_send_buffer_is_too_large() {
     let _guard = subscribe();
     let mut pair = Pair::default();

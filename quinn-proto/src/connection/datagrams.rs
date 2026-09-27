@@ -216,6 +216,13 @@ impl Datagrams<'_> {
     ///
     /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
     /// guaranteed not to cause older datagrams to be dropped.
+    ///
+    /// With the AQM's `max_reorder` bound and more than one flow queued, a
+    /// datagram enqueued behind that many others can force older ones out of
+    /// the queue, so the space is also capped at the free slots under the
+    /// bound, counted in datagrams of [`max_size`](Self::max_size). A caller
+    /// that backs off on low space then stops producing datagrams the queue
+    /// would only discard.
     pub fn send_buffer_space(&self) -> usize {
         let limit = match (
             &self.conn.config.datagram_send_buffer_bdp,
@@ -226,9 +233,24 @@ impl Datagrams<'_> {
             }
             _ => self.conn.config.datagram_send_buffer_size,
         };
-        limit
+        let bytes = limit
             .saturating_sub(self.conn.datagrams.outgoing_memory_used())
-            .saturating_sub(QUEUED_OVERHEAD)
+            .saturating_sub(QUEUED_OVERHEAD);
+        let bound = self
+            .conn
+            .config
+            .datagram_send_aqm
+            .as_ref()
+            .and_then(|config| config.max_reorder);
+        match bound {
+            Some(bound) if self.conn.datagrams.flows.len() > 1 => {
+                let free_slots = usize::try_from(bound)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(self.conn.datagrams.outgoing_count);
+                bytes.min(free_slots.saturating_mul(self.max_size().unwrap_or(0)))
+            }
+            _ => bytes,
+        }
     }
 
     /// Effective send-buffer byte limit for this enqueue: the fixed
