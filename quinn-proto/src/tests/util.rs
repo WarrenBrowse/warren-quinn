@@ -39,6 +39,8 @@ pub(super) struct Pair {
     pub(super) congestion_experienced: bool,
     // One-way
     pub(super) latency: Duration,
+    /// Bottleneck on the server-to-client direction, `None` for an infinitely fast link
+    pub(super) server_to_client_link: Option<Link>,
     /// Number of spin bit flips
     pub(super) spins: u64,
     last_spin: bool,
@@ -82,6 +84,7 @@ impl Pair {
             time: now,
             mtu: DEFAULT_MTU,
             latency: Duration::ZERO,
+            server_to_client_link: None,
             spins: 0,
             last_spin: false,
             congestion_experienced: false,
@@ -181,8 +184,15 @@ impl Pair {
             }
             if self.client.addr == packet.destination {
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                let departure = match self.server_to_client_link.as_mut() {
+                    Some(link) => match link.enqueue(self.time, packet_size) {
+                        Some(departure) => departure,
+                        None => continue,
+                    },
+                    None => self.time,
+                };
                 self.client.inbound.push_back((
-                    self.time + self.latency,
+                    departure + self.latency,
                     ecn,
                     buffer.as_ref().into(),
                 ));
@@ -275,6 +285,65 @@ impl Pair {
 
     pub(super) fn server_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
         self.server_conn_mut(ch).datagrams()
+    }
+}
+
+/// A bottleneck link: packets are serialized at `rate` bits per second behind a
+/// tail-drop queue holding at most `queue` of transmission time
+///
+/// When `batch` is set, the receiver only reads the link every `batch`: every packet that
+/// arrived in between is handed over at once, as interrupt coalescing and receive offload do
+/// on a real host. The link itself stays perfectly regular, with no jitter, as a netem delay
+/// line is.
+pub(super) struct Link {
+    pub(super) rate: u64,
+    pub(super) queue: Duration,
+    pub(super) batch: Option<Duration>,
+    epoch: Option<Instant>,
+    busy_until: Option<Instant>,
+    pub(super) dropped: u64,
+}
+
+impl Link {
+    pub(super) fn new(rate: u64, queue: Duration) -> Self {
+        Self {
+            rate,
+            queue,
+            batch: None,
+            epoch: None,
+            busy_until: None,
+            dropped: 0,
+        }
+    }
+
+    pub(super) fn with_batch(mut self, batch: Duration) -> Self {
+        self.batch = Some(batch);
+        self
+    }
+
+    /// When the receiver sees a packet that left the link at `departure`
+    fn delivery(&mut self, departure: Instant) -> Instant {
+        let Some(batch) = self.batch else {
+            return departure;
+        };
+        let epoch = *self.epoch.get_or_insert(departure);
+        let since = departure.saturating_duration_since(epoch).as_nanos();
+        let batch_ns = batch.as_nanos().max(1);
+        let slots = since.div_ceil(batch_ns);
+        epoch + Duration::from_nanos((slots * batch_ns) as u64)
+    }
+
+    /// The instant the packet has left the link, or `None` when the queue drops it
+    fn enqueue(&mut self, now: Instant, size: usize) -> Option<Instant> {
+        let start = self.busy_until.map_or(now, |busy| busy.max(now));
+        if start.saturating_duration_since(now) > self.queue {
+            self.dropped += 1;
+            return None;
+        }
+        let serialization = Duration::from_nanos(size as u64 * 8 * 1_000_000_000 / self.rate);
+        let departure = start + serialization;
+        self.busy_until = Some(departure);
+        Some(self.delivery(departure))
     }
 }
 

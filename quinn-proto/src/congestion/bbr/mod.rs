@@ -46,6 +46,10 @@ pub struct Bbr {
     exit_probe_rtt_at: Option<Instant>,
     probe_rtt_last_started_at: Option<Instant>,
     min_rtt: Duration,
+    /// When `min_rtt` was last set, which is what ages it out
+    min_rtt_timestamp: Option<Instant>,
+    /// The smallest RTT sample among the packets of the ACK being processed
+    ack_min_rtt: Option<Duration>,
     exiting_quiescence: bool,
     pacing_rate: u64,
     max_acked_packet_number: u64,
@@ -87,6 +91,8 @@ impl Bbr {
             exit_probe_rtt_at: None,
             probe_rtt_last_started_at: None,
             min_rtt: Default::default(),
+            min_rtt_timestamp: None,
+            ack_min_rtt: None,
             exiting_quiescence: false,
             pacing_rate: 0,
             max_acked_packet_number: 0,
@@ -207,6 +213,24 @@ impl Bbr {
         }
         if self.mode == Mode::Drain && in_flight <= self.get_target_cwnd(1.0) {
             self.enter_probe_bandwidth_mode(now);
+        }
+    }
+
+    /// Folds the ACK's RTT sample into the windowed min_rtt filter.
+    ///
+    /// The filter is BBR's own, as in the quiche sender this is a port of: a lower sample
+    /// always replaces the estimate, and once the estimate is [`K_MIN_RTT_EXPIRY`] old the
+    /// current sample replaces it whatever its value. The port read the connection's
+    /// lifetime minimum instead, which never rises: a path whose RTT grew after the
+    /// handshake kept the old path's `min_rtt`, so `bw x min_rtt` sized the window for a
+    /// round trip the path no longer had and the throughput collapsed with it.
+    fn update_min_rtt(&mut self, now: Instant, sample: Duration) {
+        let expired = self
+            .min_rtt_timestamp
+            .is_none_or(|stamp| now.saturating_duration_since(stamp) > K_MIN_RTT_EXPIRY);
+        if expired || self.min_rtt.is_zero() || sample < self.min_rtt {
+            self.min_rtt = sample;
+            self.min_rtt_timestamp = Some(now);
         }
     }
 
@@ -403,14 +427,15 @@ impl Controller for Bbr {
         sent: Instant,
         bytes: u64,
         app_limited: bool,
-        rtt: &RttEstimator,
+        _rtt: &RttEstimator,
     ) {
         self.max_bandwidth
             .on_ack(now, sent, bytes, self.round_count, app_limited);
         self.acked_bytes += bytes;
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
-            self.min_rtt = rtt.min();
-        }
+        // The packet's own round trip, peer ACK delay included, as the quiche sender
+        // measures it; the connection's `RttEstimator` only keeps a lifetime minimum.
+        let sample = now.saturating_duration_since(sent);
+        self.ack_min_rtt = Some(self.ack_min_rtt.map_or(sample, |min| min.min(sample)));
     }
 
     fn on_end_acks(
@@ -420,6 +445,9 @@ impl Controller for Bbr {
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
     ) {
+        if let Some(sample) = self.ack_min_rtt.take() {
+            self.update_min_rtt(now, sample);
+        }
         let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
             bytes_acked,
@@ -658,6 +686,9 @@ const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
 // Do not allow initial congestion window to be greater than 200 packets.
 const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
+/// How long a `min_rtt` estimate stands before the current RTT sample replaces it
+const K_MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
+
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
 
@@ -694,6 +725,77 @@ mod tests {
         }
         bbr.on_end_acks(ack_at, 0, app_limited, Some(first + packets - 1));
         ack_at
+    }
+
+    /// Sends one packet at `sent` and acks it alone at `acked`.
+    fn ack_one(bbr: &mut Bbr, rtt: &RttEstimator, pn: &mut u64, sent: Instant, acked: Instant) {
+        bbr.on_sent(sent, 1200, *pn);
+        bbr.on_ack(acked, sent, 1200, true, rtt);
+        bbr.on_end_acks(acked, 0, true, Some(*pn));
+        *pn += 1;
+    }
+
+    #[test]
+    fn min_rtt_follows_a_path_whose_rtt_rose() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        // The connection's estimator keeps a lifetime minimum: it must not be what BBR reads.
+        let rtt = RttEstimator::new(Duration::from_millis(1));
+        let mut pn = 0u64;
+
+        ack_one(
+            &mut bbr,
+            &rtt,
+            &mut pn,
+            start,
+            start + Duration::from_millis(1),
+        );
+        assert_eq!(bbr.min_rtt, Duration::from_millis(1));
+
+        // The path now takes 40 ms: the old minimum stands for the filter's window...
+        let mut now = start;
+        while now < start + Duration::from_millis(9_900) {
+            now += Duration::from_millis(100);
+            ack_one(
+                &mut bbr,
+                &rtt,
+                &mut pn,
+                now,
+                now + Duration::from_millis(40),
+            );
+        }
+        assert_eq!(
+            bbr.min_rtt,
+            Duration::from_millis(1),
+            "a lower min_rtt stands until it is K_MIN_RTT_EXPIRY old"
+        );
+
+        // ... and once it is older than that, the path's RTT replaces it.
+        now = start + Duration::from_millis(10_200);
+        ack_one(
+            &mut bbr,
+            &rtt,
+            &mut pn,
+            now,
+            now + Duration::from_millis(40),
+        );
+        assert_eq!(
+            bbr.min_rtt,
+            Duration::from_millis(40),
+            "an expired min_rtt must take the path's current RTT, or bw x min_rtt keeps \
+             sizing the window for a round trip the path no longer has"
+        );
+
+        // A lower sample still wins at once.
+        now += Duration::from_millis(100);
+        ack_one(
+            &mut bbr,
+            &rtt,
+            &mut pn,
+            now,
+            now + Duration::from_millis(30),
+        );
+        assert_eq!(bbr.min_rtt, Duration::from_millis(30));
     }
 
     #[test]
