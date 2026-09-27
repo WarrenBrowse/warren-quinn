@@ -155,6 +155,25 @@ old tags are unaffected; only `main` was rebuilt.
    CoDel, and overflow evicting from the fattest flow. A bulk flow's standing
    queue can no longer starve or delay a sparse flow multiplexed on the same
    connection.
+
+   Since fork.14 that reordering is bounded (`DatagramAqmConfig::max_reorder`,
+   default 768, `None` = unbounded). A receiver that numbers its datagrams and
+   gates them with a sliding anti-replay window (RFC 6479; a tunnel's is
+   typically 1024 wide) discards any datagram that arrives more than the window
+   behind the newest one it has seen. New-flow priority sends a sparse datagram
+   ahead of a bulk flow's whole backlog, so once that backlog is deeper than
+   the window, every bulk datagram left behind is rejected on arrival: on a
+   loopback probe with a 1024 window, up to 37k of 38k bulk datagrams under a
+   3.6x overload and 3-30k per run at 200-400 Mbps. The scheduler now indexes
+   the enqueue order (one `u32` per queued datagram, charged in
+   `QUEUED_OVERHEAD`) and never lets a queued datagram fall `max_reorder` or
+   more positions behind the newest one sent: when DRR's choice would, the
+   oldest queued datagram goes first, or is dropped when it has already waited
+   past the CoDel target, so the flow DRR picked is not held over target by a
+   backlog it did not build (its own CoDel would then punish it).
+   `datagram_tx.reorder_forced` and `dropped_reorder` count the two outcomes.
+   Below the bound the scheduler is unchanged, which keeps the fork.11
+   behaviour wherever the backlog is shallower than the window.
 7. **BDP-adaptive datagram send buffer**
    (`TransportConfig::datagram_send_buffer_bdp`, on by default): the fixed
    `datagram_send_buffer_size` is a worst-case constant, 1-2 orders of
@@ -271,6 +290,9 @@ the primary upgrade path is now a plain `git rebase`.
   into a `DatagramBuffer` with per-entry accounting, so the fork's four
   historical steps were re-applied as a single resolution against it rather
   than re-resolved four times.
+- `fork-datagram-reorder-bound.patch`: the reorder bound on that queue
+  (delta 6, since fork.14) with its tests. Applies on top of
+  `fork-datagram-fqcodel-bdp.patch`.
 
 The `fork-` prefix marks deltas that stay fork-local per `UPSTREAM-PR.md`;
 the `upstream-` patches are intended for submission.
