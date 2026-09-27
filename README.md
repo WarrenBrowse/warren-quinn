@@ -169,12 +169,15 @@ old tags are unaffected; only `main` was rebuilt.
    `QUEUED_OVERHEAD`) and never lets a queued datagram fall `max_reorder` or
    more positions behind the newest one sent: when DRR's choice would, the
    oldest queued datagram goes first. It is dropped instead when it has
-   already waited past the CoDel target AND its flow holds at least as much
-   backlog as the flow DRR picked, so a sparse flow is not held over target by
-   a backlog it did not build (its own CoDel would then punish it), while a
-   thin flow left oldest by a sender stall or by overflow eviction is always
-   sent, never made the victim (a first cut dropped those too, and a tunnel's
-   path-health probes died with them).
+   already waited past the CoDel target AND its flow holds at least its fair
+   share of the queued bytes (RFC 8290's overlimit victim, the flow building
+   the backlog), so a sparse flow is not held over target by a backlog it did
+   not build (its own CoDel would then punish it), while a thin flow left
+   oldest by a sender stall or by overflow eviction is always sent, never made
+   the victim. Two earlier cuts got the victim wrong and a Hetzner A/B caught
+   both: dropping any stale datagram killed a tunnel's path-health probes, and
+   comparing only against the flow DRR picked let a ping make a 1 Mbit/s flow
+   the victim (39% loss under overload).
    `datagram_tx.reorder_forced` and `dropped_reorder` count the two outcomes.
    Below the bound the scheduler is unchanged, which keeps the fork.11
    behaviour wherever the backlog is shallower than the window.
