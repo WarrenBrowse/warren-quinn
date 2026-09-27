@@ -177,7 +177,12 @@ old tags are unaffected; only `main` was rebuilt.
    the victim. Two earlier cuts got the victim wrong and a Hetzner A/B caught
    both: dropping any stale datagram killed a tunnel's path-health probes, and
    comparing only against the flow DRR picked let a ping make a 1 Mbit/s flow
-   the victim (39% loss under overload).
+   the victim (39% loss under overload). `send_buffer_space()` also counts
+   the bound: with several flows queued it is capped at the free slots under
+   `max_reorder` (in datagrams of `max_size()`), because past that depth a new
+   datagram forces older ones out. Without it a caller that backs off on low
+   space (the tunnel exit's reader-side tail-drop) never saw the queue fill,
+   kept sealing datagrams the queue then discarded, and its sender slowed.
    `datagram_tx.reorder_forced` and `dropped_reorder` count the two outcomes.
    Below the bound the scheduler is unchanged, which keeps the fork.11
    behaviour wherever the backlog is shallower than the window.

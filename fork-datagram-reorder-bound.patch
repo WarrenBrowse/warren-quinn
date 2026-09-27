@@ -47,7 +47,7 @@ index 7cd7ae19..101503e1 100644
      }
  }
 diff --git a/quinn-proto/src/connection/datagrams.rs b/quinn-proto/src/connection/datagrams.rs
-index a41e0cab..b76f2148 100644
+index a41e0cab..5386432d 100644
 --- a/quinn-proto/src/connection/datagrams.rs
 +++ b/quinn-proto/src/connection/datagrams.rs
 @@ -163,13 +163,7 @@ impl Datagrams<'_> {
@@ -65,7 +65,48 @@ index a41e0cab..b76f2148 100644
          Ok(())
      }
  
-@@ -270,6 +264,9 @@ fn adaptive_send_buffer_limit(
+@@ -222,6 +216,13 @@ impl Datagrams<'_> {
+     ///
+     /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
+     /// guaranteed not to cause older datagrams to be dropped.
++    ///
++    /// With the AQM's `max_reorder` bound and more than one flow queued, a
++    /// datagram enqueued behind that many others can force older ones out of
++    /// the queue, so the space is also capped at the free slots under the
++    /// bound, counted in datagrams of [`max_size`](Self::max_size). A caller
++    /// that backs off on low space then stops producing datagrams the queue
++    /// would only discard.
+     pub fn send_buffer_space(&self) -> usize {
+         let limit = match (
+             &self.conn.config.datagram_send_buffer_bdp,
+@@ -232,9 +233,24 @@ impl Datagrams<'_> {
+             }
+             _ => self.conn.config.datagram_send_buffer_size,
+         };
+-        limit
++        let bytes = limit
+             .saturating_sub(self.conn.datagrams.outgoing_memory_used())
+-            .saturating_sub(QUEUED_OVERHEAD)
++            .saturating_sub(QUEUED_OVERHEAD);
++        let bound = self
++            .conn
++            .config
++            .datagram_send_aqm
++            .as_ref()
++            .and_then(|config| config.max_reorder);
++        match bound {
++            Some(bound) if self.conn.datagrams.flows.len() > 1 => {
++                let free_slots = usize::try_from(bound)
++                    .unwrap_or(usize::MAX)
++                    .saturating_sub(self.conn.datagrams.outgoing_count);
++                bytes.min(free_slots.saturating_mul(self.max_size().unwrap_or(0)))
++            }
++            _ => bytes,
++        }
+     }
+ 
+     /// Effective send-buffer byte limit for this enqueue: the fixed
+@@ -270,6 +286,9 @@ fn adaptive_send_buffer_limit(
  /// of the head-of-line datagram, not the buffer's byte occupancy.
  pub(super) struct QueuedDatagram {
      queued_at: Instant,
@@ -75,7 +116,7 @@ index a41e0cab..b76f2148 100644
      datagram: Datagram,
  }
  
-@@ -286,8 +283,8 @@ impl QueuedDatagram {
+@@ -286,8 +305,8 @@ impl QueuedDatagram {
  /// empty datagrams inside a finite byte budget, which is the hole upstream
  /// closed by charging `size_of::<Datagram>()` per entry. A queued datagram
  /// here also carries its enqueue timestamp, so the fork charges the size of
@@ -86,7 +127,7 @@ index a41e0cab..b76f2148 100644
  
  /// Head-drop CoDel controller state (RFC 8289) for the outgoing datagram queue
  ///
-@@ -450,6 +447,17 @@ pub(super) struct DatagramState {
+@@ -450,6 +469,17 @@ pub(super) struct DatagramState {
      old_flows: VecDeque<u32>,
      /// Smoothed BDP estimate driving adaptive send-buffer sizing
      bdp_ewma: Option<u64>,
@@ -104,7 +145,7 @@ index a41e0cab..b76f2148 100644
  }
  
  impl DatagramState {
-@@ -469,7 +477,14 @@ impl DatagramState {
+@@ -469,7 +499,14 @@ impl DatagramState {
      }
      /// Queue a datagram on its flow bucket, registering a fresh bucket with
      /// the DRR scheduler
@@ -120,7 +161,7 @@ index a41e0cab..b76f2148 100644
          self.outgoing_total += datagram.datagram.data.len();
          self.outgoing_count += 1;
          match self.flows.get_mut(&bucket) {
-@@ -487,6 +502,38 @@ impl DatagramState {
+@@ -487,6 +524,38 @@ impl DatagramState {
          }
      }
  
@@ -159,7 +200,7 @@ index a41e0cab..b76f2148 100644
      /// Drop the head of the flow with the largest backlog (RFC 8290's
      /// overlimit behavior), returning its payload length
      ///
-@@ -629,6 +676,13 @@ impl DatagramState {
+@@ -629,6 +698,13 @@ impl DatagramState {
      /// sojourn time keeps the queue above the latency target are dropped
      /// (and counted in `stats`) instead of transmitted. A drained flow is
      /// unregistered, so an idle connection carries no per-flow state.
@@ -173,7 +214,7 @@ index a41e0cab..b76f2148 100644
      pub(super) fn write(
          &mut self,
          buf: &mut Vec<u8>,
-@@ -641,7 +695,12 @@ impl DatagramState {
+@@ -641,7 +717,12 @@ impl DatagramState {
              let (list, bucket) = match (self.new_flows.front(), self.old_flows.front()) {
                  (Some(&b), _) => (FlowList::New, b),
                  (None, Some(&b)) => (FlowList::Old, b),
@@ -187,7 +228,7 @@ index a41e0cab..b76f2148 100644
              };
              let flow = self
                  .flows
-@@ -660,28 +719,59 @@ impl DatagramState {
+@@ -660,28 +741,59 @@ impl DatagramState {
                  continue;
              }
  
@@ -263,7 +304,7 @@ index a41e0cab..b76f2148 100644
                  if flow
                      .codel
                      .should_drop(sojourn, self.outgoing_total, now, config)
-@@ -714,6 +804,13 @@ impl DatagramState {
+@@ -714,6 +826,13 @@ impl DatagramState {
              self.outgoing_count -= 1;
              flow.bytes -= datagram.data.len();
              flow.deficit -= size as i64;
@@ -277,7 +318,7 @@ index a41e0cab..b76f2148 100644
              datagram.encode(true, buf);
              return true;
          }
-@@ -850,13 +947,7 @@ mod tests {
+@@ -850,13 +969,7 @@ mod tests {
      /// at `queued_at`.
      fn push(state: &mut DatagramState, bucket: u32, tag: u8, len: usize, queued_at: Instant) {
          let data = Bytes::from(vec![tag; len]);
@@ -292,7 +333,7 @@ index a41e0cab..b76f2148 100644
      }
  
      /// Total bytes queued across every flow, recomputed from scratch.
-@@ -1425,6 +1516,374 @@ mod tests {
+@@ -1425,6 +1538,374 @@ mod tests {
          assert_eq!(state.outgoing_count, 0);
          assert_eq!(state.outgoing_total, 0);
      }
@@ -702,3 +743,65 @@ index 69883265..bc669792 100644
      /// Datagrams accepted into the send buffer whose inner packet was Not-ECT
      ///
      /// The four `ecn_*` counters record the ECN codepoint distribution of the
+diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
+index edd38055..8f2fb4b4 100644
+--- a/quinn-proto/src/tests/mod.rs
++++ b/quinn-proto/src/tests/mod.rs
+@@ -2480,6 +2480,57 @@ fn datagram_send_buffer_space_preserves_queued_datagrams() {
+     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+ }
+ 
++#[test]
++fn datagram_send_buffer_space_counts_the_reorder_bound_slots() {
++    // With several flows queued, a datagram enqueued behind `max_reorder`
++    // others can force older ones out of the queue (sent out of turn or
++    // dropped), so the advertised space must shrink to the free slots. A
++    // caller that backs off on low space (a tunnel's reader-side tail-drop)
++    // otherwise keeps sealing datagrams the queue is about to discard.
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let mut aqm = crate::DatagramAqmConfig::default();
++    aqm.max_reorder(Some(64));
++    let mut transport_config = TransportConfig::default();
++    transport_config.datagram_send_aqm(Some(aqm));
++    transport_config.datagram_send_buffer_size(16 * 1024 * 1024);
++    let mut client_config = client_config();
++    client_config.transport_config(transport_config.into());
++    let (client_ch, _) = pair.connect_with(client_config);
++    let max = pair.client_datagrams(client_ch).max_size().unwrap();
++    let flow = |f| DatagramClass {
++        flow: Some(f),
++        ecn: None,
++    };
++    let now = pair.time;
++
++    for _ in 0..60 {
++        pair.client_datagrams(client_ch)
++            .send_classified(vec![1; 100].into(), true, now, flow(1))
++            .unwrap();
++    }
++    let single = pair.client_datagrams(client_ch).send_buffer_space();
++    assert!(
++        single > 1024 * 1024,
++        "one flow cannot be reordered: the byte budget alone applies, got {single}"
++    );
++
++    pair.client_datagrams(client_ch)
++        .send_classified(vec![2; 100].into(), true, now, flow(2))
++        .unwrap();
++    assert_eq!(
++        pair.client_datagrams(client_ch).send_buffer_space(),
++        3 * max,
++        "61 of 64 slots used: three datagrams of the largest size remain"
++    );
++    for _ in 0..3 {
++        pair.client_datagrams(client_ch)
++            .send_classified(vec![1; 100].into(), true, now, flow(1))
++            .unwrap();
++    }
++    assert_eq!(pair.client_datagrams(client_ch).send_buffer_space(), 0);
++}
++
+ #[test]
+ fn datagram_larger_than_send_buffer_is_too_large() {
+     let _guard = subscribe();
