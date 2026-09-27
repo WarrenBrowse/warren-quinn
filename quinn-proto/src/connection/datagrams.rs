@@ -163,13 +163,7 @@ impl Datagrams<'_> {
         }
         self.conn.stats.datagram_tx.record_ecn(class.ecn);
         let bucket = bucket_for(class.flow, self.conn.config.datagram_send_aqm.as_ref());
-        self.conn.datagrams.enqueue(
-            bucket,
-            QueuedDatagram {
-                queued_at: now,
-                datagram: Datagram { data },
-            },
-        );
+        self.conn.datagrams.enqueue(bucket, Datagram { data }, now);
         Ok(())
     }
 
@@ -270,6 +264,9 @@ fn adaptive_send_buffer_limit(
 /// of the head-of-line datagram, not the buffer's byte occupancy.
 pub(super) struct QueuedDatagram {
     queued_at: Instant,
+    /// Position in the connection-wide enqueue order, which is what the
+    /// reorder bound is measured in
+    ordinal: u64,
     datagram: Datagram,
 }
 
@@ -286,8 +283,8 @@ impl QueuedDatagram {
 /// empty datagrams inside a finite byte budget, which is the hole upstream
 /// closed by charging `size_of::<Datagram>()` per entry. A queued datagram
 /// here also carries its enqueue timestamp, so the fork charges the size of
-/// the type it actually allocates.
-pub(crate) const QUEUED_OVERHEAD: usize = size_of::<QueuedDatagram>();
+/// the type it actually allocates, plus its entry in the enqueue-order index.
+pub(crate) const QUEUED_OVERHEAD: usize = size_of::<QueuedDatagram>() + size_of::<u32>();
 
 /// Head-drop CoDel controller state (RFC 8289) for the outgoing datagram queue
 ///
@@ -450,6 +447,17 @@ pub(super) struct DatagramState {
     old_flows: VecDeque<u32>,
     /// Smoothed BDP estimate driving adaptive send-buffer sizing
     bdp_ewma: Option<u64>,
+    /// Ordinal the next enqueued datagram receives
+    next_ordinal: u64,
+    /// Bucket of every datagram enqueued since ordinal `age_base`, in
+    /// enqueue order: entry `i` belongs to ordinal `age_base + i`
+    ///
+    /// Entries of datagrams that already left the queue are pruned lazily
+    /// from the front, so the front is always the oldest queued datagram.
+    age: VecDeque<u32>,
+    age_base: u64,
+    /// Ordinal of the newest datagram written so far
+    newest_sent: Option<u64>,
 }
 
 impl DatagramState {
@@ -469,7 +477,14 @@ impl DatagramState {
     }
     /// Queue a datagram on its flow bucket, registering a fresh bucket with
     /// the DRR scheduler
-    pub(super) fn enqueue(&mut self, bucket: u32, datagram: QueuedDatagram) {
+    pub(super) fn enqueue(&mut self, bucket: u32, datagram: Datagram, queued_at: Instant) {
+        let datagram = QueuedDatagram {
+            queued_at,
+            ordinal: self.next_ordinal,
+            datagram,
+        };
+        self.next_ordinal += 1;
+        self.age.push_back(bucket);
         self.outgoing_total += datagram.datagram.data.len();
         self.outgoing_count += 1;
         match self.flows.get_mut(&bucket) {
@@ -485,6 +500,38 @@ impl DatagramState {
                 self.new_flows.push_back(bucket);
             }
         }
+    }
+
+    /// Ordinal and bucket of the oldest datagram still queued
+    ///
+    /// Every flow is FIFO in ordinal order, so an index entry is live exactly
+    /// when its ordinal is still its bucket's head once every older entry has
+    /// been pruned; anything else left the queue (sent, dropped, evicted).
+    fn oldest_queued(&mut self) -> Option<(u64, u32)> {
+        while let Some(&bucket) = self.age.front() {
+            let head = self
+                .flows
+                .get(&bucket)
+                .and_then(|flow| flow.queue.front())
+                .map(|queued| queued.ordinal);
+            if head == Some(self.age_base) {
+                return Some((self.age_base, bucket));
+            }
+            self.age.pop_front();
+            self.age_base += 1;
+        }
+        None
+    }
+
+    /// The bucket that must be served instead of `candidate`'s when sending
+    /// the datagram with ordinal `candidate` would leave some queued datagram
+    /// `max_reorder` or more positions behind the newest one sent
+    fn reorder_override(&mut self, candidate: u64, max_reorder: u64) -> Option<u32> {
+        let (oldest, bucket) = self.oldest_queued()?;
+        let newest = self
+            .newest_sent
+            .map_or(candidate, |sent| sent.max(candidate));
+        (newest.saturating_sub(oldest) >= max_reorder).then_some(bucket)
     }
 
     /// Drop the head of the flow with the largest backlog (RFC 8290's
@@ -629,6 +676,12 @@ impl DatagramState {
     /// sojourn time keeps the queue above the latency target are dropped
     /// (and counted in `stats`) instead of transmitted. A drained flow is
     /// unregistered, so an idle connection carries no per-flow state.
+    ///
+    /// The AQM's `max_reorder` bounds the reordering DRR introduces: when
+    /// the scheduled flow's head would leave an older datagram that far
+    /// behind the newest one sent, the oldest queued datagram is served
+    /// first, charged to its own flow's DRR credit, or dropped when it has
+    /// already waited past the AQM target.
     pub(super) fn write(
         &mut self,
         buf: &mut Vec<u8>,
@@ -641,7 +694,12 @@ impl DatagramState {
             let (list, bucket) = match (self.new_flows.front(), self.old_flows.front()) {
                 (Some(&b), _) => (FlowList::New, b),
                 (None, Some(&b)) => (FlowList::Old, b),
-                (None, None) => return false,
+                (None, None) => {
+                    // Nothing queued anywhere: every index entry is stale.
+                    self.age.clear();
+                    self.age_base = self.next_ordinal;
+                    return false;
+                }
             };
             let flow = self
                 .flows
@@ -660,28 +718,50 @@ impl DatagramState {
                 continue;
             }
 
-            let queued = match flow.queue.pop_front() {
-                Some(x) => x,
-                None => {
-                    // Drained flow: a new-list flow gets one final round on
-                    // the old list (RFC 8290: prevents cycling through the
-                    // priority list), an old-list flow is unregistered.
-                    match list {
-                        FlowList::New => {
-                            self.new_flows.pop_front();
-                            self.old_flows.push_back(bucket);
-                        }
-                        FlowList::Old => {
-                            self.old_flows.pop_front();
-                            self.flows.remove(&bucket);
-                        }
+            let Some(head) = flow.queue.front().map(|queued| queued.ordinal) else {
+                // Drained flow: a new-list flow gets one final round on
+                // the old list (RFC 8290: prevents cycling through the
+                // priority list), an old-list flow is unregistered.
+                match list {
+                    FlowList::New => {
+                        self.new_flows.pop_front();
+                        self.old_flows.push_back(bucket);
                     }
-                    continue;
+                    FlowList::Old => {
+                        self.old_flows.pop_front();
+                        self.flows.remove(&bucket);
+                    }
                 }
+                continue;
             };
+
+            let served = aqm
+                .and_then(|config| config.max_reorder)
+                .and_then(|max_reorder| self.reorder_override(head, max_reorder))
+                .unwrap_or(bucket);
+            let flow = self
+                .flows
+                .get_mut(&served)
+                .expect("the served bucket holds a queued datagram");
+            let queued = flow
+                .queue
+                .pop_front()
+                .expect("the served bucket holds a queued datagram");
 
             if let Some(config) = aqm {
                 let sojourn = now.saturating_duration_since(queued.queued_at);
+                // A datagram served out of turn delays the flow the scheduler
+                // picked. Once it has waited past the latency target it is
+                // stale by the AQM's own standard, and sending it would push
+                // that flow over target too, where its own CoDel punishes it
+                // for a backlog it did not build: drop it instead.
+                if served != bucket && sojourn >= config.target {
+                    self.outgoing_total -= queued.datagram.data.len();
+                    self.outgoing_count -= 1;
+                    flow.bytes -= queued.datagram.data.len();
+                    stats.dropped_reorder += 1;
+                    continue;
+                }
                 if flow
                     .codel
                     .should_drop(sojourn, self.outgoing_total, now, config)
@@ -714,6 +794,13 @@ impl DatagramState {
             self.outgoing_count -= 1;
             flow.bytes -= datagram.data.len();
             flow.deficit -= size as i64;
+            self.newest_sent = Some(
+                self.newest_sent
+                    .map_or(queued.ordinal, |sent| sent.max(queued.ordinal)),
+            );
+            if served != bucket {
+                stats.reorder_forced += 1;
+            }
             datagram.encode(true, buf);
             return true;
         }
@@ -850,13 +937,7 @@ mod tests {
     /// at `queued_at`.
     fn push(state: &mut DatagramState, bucket: u32, tag: u8, len: usize, queued_at: Instant) {
         let data = Bytes::from(vec![tag; len]);
-        state.enqueue(
-            bucket,
-            QueuedDatagram {
-                queued_at,
-                datagram: Datagram { data },
-            },
-        );
+        state.enqueue(bucket, Datagram { data }, queued_at);
     }
 
     /// Total bytes queued across every flow, recomputed from scratch.
@@ -1424,6 +1505,313 @@ mod tests {
         assert_eq!(state.outgoing_count, recount_entries(&state));
         assert_eq!(state.outgoing_count, 0);
         assert_eq!(state.outgoing_total, 0);
+    }
+
+    /// Enqueue a `len`-byte payload (`len >= 4`) whose last four bytes carry
+    /// `ordinal`, its position in the connection-wide enqueue order.
+    fn push_ordinal(
+        state: &mut DatagramState,
+        bucket: u32,
+        ordinal: u32,
+        len: usize,
+        queued_at: Instant,
+    ) {
+        let mut data = vec![0u8; len - 4];
+        data.extend_from_slice(&ordinal.to_be_bytes());
+        state.enqueue(
+            bucket,
+            Datagram {
+                data: Bytes::from(data),
+            },
+            queued_at,
+        );
+    }
+
+    /// Ordinal of the datagram whose frame was just encoded into `buf`: the
+    /// payload is the tail of the frame, and the ordinal the payload's tail.
+    fn sent_ordinal(buf: &[u8]) -> u32 {
+        u32::from_be_bytes(buf[buf.len() - 4..].try_into().unwrap())
+    }
+
+    /// Receivers commonly gate datagrams with a sliding anti-replay window
+    /// (RFC 6479): a datagram more than the window behind the newest one
+    /// received is discarded as too old.
+    const ANTI_REPLAY_WINDOW: u32 = 1024;
+
+    #[test]
+    fn fair_queue_never_reorders_a_datagram_out_of_an_anti_replay_window() {
+        // A deep bulk flow plus a sparse flow that keeps arriving. New-flow
+        // priority sends every sparse datagram ahead of the whole bulk
+        // backlog, so without a bound the bulk datagrams leave thousands of
+        // positions behind the newest one sent, and every one of them is
+        // rejected by the receiver's window.
+        let mut state = DatagramState::default();
+        let config = aqm();
+        let mut stats = DatagramTxStats::default();
+        let now = Instant::now();
+        let mut ordinal = 0u32;
+        for _ in 0..3000 {
+            push_ordinal(&mut state, 1, ordinal, 1200, now);
+            ordinal += 1;
+        }
+        let (mut newest, mut worst_lag, mut sent) = (0u32, 0u32, 0u32);
+        for step in 0..8000u32 {
+            if step % 20 == 0 {
+                push_ordinal(&mut state, 2, ordinal, 100, now);
+                ordinal += 1;
+            }
+            if step % 2 == 0 {
+                push_ordinal(&mut state, 1, ordinal, 1200, now);
+                ordinal += 1;
+            }
+            let mut buf = Vec::new();
+            if !state.write(&mut buf, usize::MAX, now, Some(&config), &mut stats) {
+                break;
+            }
+            let o = sent_ordinal(&buf);
+            newest = newest.max(o);
+            worst_lag = worst_lag.max(newest - o);
+            sent += 1;
+        }
+        assert_eq!(stats.dropped_aqm, 0, "no sojourn elapsed, nothing to drop");
+        assert!(sent > 3000, "the backlog must actually drain, sent {sent}");
+        assert!(
+            worst_lag < ANTI_REPLAY_WINDOW,
+            "a datagram left {worst_lag} positions behind the newest one sent: \
+             a {ANTI_REPLAY_WINDOW}-wide anti-replay window discards it"
+        );
+        let bound = config.max_reorder.unwrap();
+        assert!(
+            u64::from(worst_lag) < bound,
+            "lag {worst_lag} must stay under the configured bound {bound}"
+        );
+        assert!(stats.reorder_forced > 0, "the bound must have engaged");
+    }
+
+    /// Send up to `limit` datagrams, returning their ordinals in send order.
+    fn serve(state: &mut DatagramState, config: &DatagramAqmConfig, limit: usize) -> Vec<u32> {
+        let mut stats = DatagramTxStats::default();
+        let now = Instant::now();
+        let mut order = Vec::new();
+        while order.len() < limit {
+            let mut buf = Vec::new();
+            if !state.write(&mut buf, usize::MAX, now, Some(config), &mut stats) {
+                break;
+            }
+            order.push(sent_ordinal(&buf));
+        }
+        order
+    }
+
+    fn drain_ordinals(state: &mut DatagramState, config: &DatagramAqmConfig) -> Vec<u32> {
+        serve(state, config, usize::MAX)
+    }
+
+    /// Datagrams a 1200-byte bulk flow sends in its first DRR quantum, after
+    /// which it sits on the old-flows list and a fresh flow preempts it
+    const FIRST_QUANTUM: u32 = 13;
+
+    /// A bulk flow on bucket 1 that has spent its first quantum and still
+    /// holds `backlog` datagrams, then one sparse datagram on bucket 2.
+    /// Returns the sparse datagram's ordinal.
+    fn bulk_backlog_then_sparse(
+        state: &mut DatagramState,
+        config: &DatagramAqmConfig,
+        backlog: u32,
+    ) -> u32 {
+        let now = Instant::now();
+        for ordinal in 0..backlog + FIRST_QUANTUM {
+            push_ordinal(state, 1, ordinal, 1200, now);
+        }
+        let first = serve(state, config, FIRST_QUANTUM as usize);
+        assert_eq!(first, (0..FIRST_QUANTUM).collect::<Vec<_>>());
+        let sparse = backlog + FIRST_QUANTUM;
+        push_ordinal(state, 2, sparse, 100, now);
+        sparse
+    }
+
+    #[test]
+    fn sparse_flow_still_overtakes_a_backlog_shallower_than_the_bound() {
+        // The bound must leave fair queueing intact wherever it is harmless:
+        // behind a backlog shallower than the bound, a fresh sparse datagram
+        // still goes out first.
+        let config = aqm();
+        let backlog = config.max_reorder.unwrap() as u32 - 1;
+        let mut state = DatagramState::default();
+        let sparse = bulk_backlog_then_sparse(&mut state, &config, backlog);
+        let order = drain_ordinals(&mut state, &config);
+        assert_eq!(order[0], sparse, "the sparse datagram must go first");
+        assert_eq!(order.len(), backlog as usize + 1);
+    }
+
+    #[test]
+    fn sparse_flow_behind_a_deeper_backlog_waits_only_for_the_excess() {
+        // Behind a backlog deeper than the bound, the sparse datagram waits
+        // exactly until the oldest queued bulk datagram is within the bound
+        // of it, not for the whole backlog as plain FIFO would make it.
+        let config = aqm();
+        let bound = config.max_reorder.unwrap() as u32;
+        let backlog = bound + 200;
+        let mut state = DatagramState::default();
+        let sparse = bulk_backlog_then_sparse(&mut state, &config, backlog);
+        let order = drain_ordinals(&mut state, &config);
+        let position = order.iter().position(|&o| o == sparse).unwrap();
+        // Every bulk datagram more than `bound - 1` behind the sparse one
+        // must leave first: 201 of them.
+        assert_eq!(position as u32, backlog - bound + 1);
+        assert!(
+            order[..position].windows(2).all(|w| w[0] < w[1]),
+            "the forced datagrams leave in enqueue order"
+        );
+    }
+
+    #[test]
+    fn stale_datagrams_blocking_a_fresh_flow_are_dropped_not_sent() {
+        // The bulk backlog has already waited twice the AQM target when the
+        // sparse datagram arrives. Sending the excess first would hold the
+        // sparse flow above target for a backlog it did not build; the
+        // excess is stale anyway, so it is dropped and the sparse datagram
+        // goes out at once.
+        let config = aqm();
+        let bound = config.max_reorder.unwrap() as u32;
+        let backlog = bound + 200;
+        let mut state = DatagramState::default();
+        let mut stats = DatagramTxStats::default();
+        let start = Instant::now();
+        for ordinal in 0..backlog {
+            push_ordinal(&mut state, 1, ordinal, 1200, start);
+        }
+        let mut buf = Vec::new();
+        assert!(state.write(&mut buf, usize::MAX, start, Some(&config), &mut stats));
+        let late = start + config.target * 2;
+        push_ordinal(&mut state, 2, backlog, 100, late);
+        let mut order = Vec::new();
+        loop {
+            let mut buf = Vec::new();
+            if !state.write(&mut buf, usize::MAX, late, Some(&config), &mut stats) {
+                break;
+            }
+            order.push(sent_ordinal(&buf));
+        }
+        assert_eq!(order[..12], (1..13).collect::<Vec<_>>(), "first quantum");
+        assert_eq!(order[12], backlog, "the sparse datagram must not wait");
+        assert_eq!(stats.dropped_reorder, u64::from(backlog - bound - 12));
+        assert_eq!(
+            stats.dropped_aqm, 0,
+            "CoDel still owes the bulk an interval"
+        );
+        assert_eq!(state.outgoing_total, 0);
+        assert!(
+            order[13..].windows(2).all(|w| w[0] < w[1]) && order[13] == backlog - bound + 1,
+            "exactly the datagrams outside the bound were dropped"
+        );
+    }
+
+    #[test]
+    fn unbounded_reorder_is_an_explicit_opt_out() {
+        let mut config = aqm();
+        config.max_reorder(None);
+        let mut state = DatagramState::default();
+        let sparse = bulk_backlog_then_sparse(&mut state, &config, 3000);
+        let order = drain_ordinals(&mut state, &config);
+        assert_eq!(
+            order[0], sparse,
+            "without a bound the sparse datagram jumps all"
+        );
+
+        let now = Instant::now();
+
+        let mut strict = aqm();
+        strict.max_reorder(Some(0));
+        assert_eq!(strict.max_reorder, Some(1), "0 clamps to strict order");
+        let mut state = DatagramState::default();
+        for ordinal in 0..64 {
+            push_ordinal(&mut state, 1 + ordinal % 3, ordinal, 1200, now);
+        }
+        assert_eq!(
+            drain_ordinals(&mut state, &strict),
+            (0..64).collect::<Vec<_>>(),
+            "a bound of one is enqueue order"
+        );
+    }
+
+    #[test]
+    fn age_index_tracks_the_oldest_queued_datagram_through_every_mutation() {
+        // The index is pruned lazily; eviction, AQM drops, size pruning and
+        // forced service all remove datagrams behind its back. Whatever the
+        // interleaving, its front must name the true oldest queued datagram
+        // and the bound must hold.
+        let config = aqm();
+        let bound = config.max_reorder.unwrap();
+        let mut state = DatagramState::default();
+        let mut stats = DatagramTxStats::default();
+        let start = Instant::now();
+        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let (mut ordinal, mut newest, mut worst_lag) = (0u32, 0u32, 0u32);
+        for step in 0..200_000u32 {
+            let now = start + Duration::from_micros(u64::from(step) * 10);
+            // Alternating fill and drain phases, so backlogs deep enough to
+            // engage the bound build up and then empty out.
+            let filling = (step / 4000) % 2 == 0;
+            let roll = next() % 64;
+            match roll {
+                0 => {
+                    state.evict_from_fattest_flow();
+                }
+                1 if next() % 64 == 0 => {
+                    state.drop_oversized(900);
+                }
+                _ if roll < if filling { 48 } else { 16 } => {
+                    // Skewed toward one fat bucket so backlogs build up.
+                    let bucket = match next() % 4 {
+                        0 => (next() % 9) as u32,
+                        _ => 1,
+                    };
+                    let len = 4 + (next() % 1200) as usize;
+                    push_ordinal(&mut state, bucket, ordinal, len, now);
+                    ordinal += 1;
+                }
+                _ => {
+                    let mut buf = Vec::new();
+                    if state.write(&mut buf, usize::MAX, now, Some(&config), &mut stats) {
+                        let o = sent_ordinal(&buf);
+                        newest = newest.max(o);
+                        worst_lag = worst_lag.max(newest - o);
+                    }
+                }
+            }
+            let brute = state
+                .flows
+                .iter()
+                .filter_map(|(&b, q)| q.queue.front().map(|d| (d.ordinal, b)))
+                .min();
+            assert_eq!(state.oldest_queued(), brute, "step {step}");
+            assert!(
+                state.age.len() as u64 <= state.next_ordinal - state.age_base,
+                "the index holds one entry per ordinal"
+            );
+        }
+        assert!(
+            u64::from(worst_lag) < bound,
+            "lag {worst_lag} broke the bound {bound}"
+        );
+        assert!(
+            stats.reorder_forced > 0 && stats.dropped_reorder > 0,
+            "the workload must exercise both outcomes of the bound: {stats:?}"
+        );
+        drain_ordinals(&mut state, &config);
+        let mut buf = Vec::new();
+        assert!(!state.write(&mut buf, usize::MAX, start, Some(&config), &mut stats));
+        assert!(
+            state.age.is_empty(),
+            "an empty queue leaves no index behind"
+        );
     }
 }
 
