@@ -426,11 +426,10 @@ impl Controller for Bbr {
         now: Instant,
         sent: Instant,
         bytes: u64,
-        app_limited: bool,
+        _app_limited: bool,
         _rtt: &RttEstimator,
     ) {
-        self.max_bandwidth
-            .on_ack(now, sent, bytes, self.round_count, app_limited);
+        self.max_bandwidth.on_ack(now, sent, bytes, self.min_rtt);
         self.acked_bytes += bytes;
         // The packet's own round trip, peer ACK delay included, as the quiche sender
         // measures it; the connection's `RttEstimator` only keeps a lifetime minimum.
@@ -750,6 +749,35 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_sample_counts_every_packet_the_ack_covers() {
+        let start = Instant::now();
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        bbr.probe_rtt_last_started_at = Some(start);
+        let rtt = RttEstimator::new(Duration::from_millis(20));
+        // Round one sets the delivery clock: 10 packets in one batch, one ACK 20 ms later.
+        for pn in 0..10u64 {
+            bbr.on_sent(start, 1200, pn);
+        }
+        let acked = start + Duration::from_millis(20);
+        for _ in 0..10 {
+            bbr.on_ack(acked, start, 1200, false, &rtt);
+        }
+        bbr.on_end_acks(acked, 0, false, Some(9));
+        // Round two: 40 packets sent at once, acknowledged by a single ACK one RTT later.
+        for pn in 10..50u64 {
+            bbr.on_sent(acked, 1200, pn);
+        }
+        let now = acked + Duration::from_millis(20);
+        for _ in 0..40 {
+            bbr.on_ack(now, acked, 1200, false, &rtt);
+        }
+        bbr.on_end_acks(now, 0, false, Some(49));
+        // 48 000 bytes delivered over 20 ms: 2.4 MB/s. Reading one packet per ACK frame
+        // would see 1200 B over 20 ms, a fortieth of it.
+        assert_eq!(bbr.max_bandwidth.get_estimate(), 2_400_000);
+    }
+
+    #[test]
     fn min_rtt_follows_a_path_whose_rtt_rose() {
         let start = Instant::now();
         let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
@@ -989,15 +1017,16 @@ mod tests {
         let rtt = RttEstimator::new(Duration::from_millis(20));
         let mut pn = 0u64;
 
-        // Two fast seed rounds (120 MB/s samples): a large BDP-derived target,
-        // and too few non-growth rounds to trigger full-bandwidth detection.
+        // Two fast seed rounds (2000 packets 10 us apart, a 120 MB/s delivery
+        // rate): a large BDP-derived target, and too few non-growth rounds to
+        // trigger full-bandwidth detection.
         for _ in 0..2 {
             now = run_round(
                 &mut bbr,
                 &rtt,
                 now,
                 &mut pn,
-                33,
+                2000,
                 1200,
                 Duration::from_micros(10),
                 false,
@@ -1013,7 +1042,7 @@ mod tests {
                 &rtt,
                 now,
                 &mut pn,
-                33,
+                2000,
                 1200,
                 Duration::from_micros(10),
                 true,

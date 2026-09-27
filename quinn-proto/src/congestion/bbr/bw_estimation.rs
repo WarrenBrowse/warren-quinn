@@ -1,80 +1,108 @@
+use std::collections::VecDeque;
 use std::fmt::{Debug, Display, Formatter};
 
 use super::min_max::MinMax;
 use crate::{Duration, Instant};
 
+/// Delivery-rate sampler (draft-cheng-iccrg-delivery-rate-estimation), feeding BBR's
+/// windowed max bandwidth filter.
+///
+/// Every send records how much had been delivered at that moment; when a packet is
+/// acknowledged, the bytes delivered since its send over the longer of its send and ack
+/// intervals is one rate sample. The port this replaces divided a single packet's size by
+/// the time since the previous ACK frame, which reads a delivery rate divided by the
+/// number of packets each ACK covers, and a burst of ACKs as a spike.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BandwidthEstimation {
     total_acked: u64,
-    prev_total_acked: u64,
-    acked_time: Option<Instant>,
-    prev_acked_time: Option<Instant>,
-    total_sent: u64,
-    prev_total_sent: u64,
-    sent_time: Option<Instant>,
-    prev_sent_time: Option<Instant>,
-    max_filter: MinMax,
     acked_at_last_window: u64,
+    /// Bytes delivered over the connection's life
+    delivered: u64,
+    /// When `delivered` last grew
+    delivered_time: Option<Instant>,
+    /// Send time of the most recently delivered packet
+    first_sent_time: Option<Instant>,
+    /// Delivery state at each send instant still in flight, oldest first
+    sends: VecDeque<SendState>,
+    /// The sample of the most recently sent packet the current ACK acknowledges
+    pending: Option<RateSample>,
+    max_filter: MinMax,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SendState {
+    sent: Instant,
+    delivered: u64,
+    delivered_time: Instant,
+    first_sent_time: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RateSample {
+    /// `delivered` at the acknowledged packet's send, which orders samples by recency
+    prior_delivered: u64,
+    bytes_per_second: u64,
+}
+
+/// Send instants tracked at most; past this the oldest are forgotten and their packets,
+/// when acknowledged, yield no sample
+const MAX_TRACKED_SENDS: usize = 16_384;
+
 impl BandwidthEstimation {
-    pub(crate) fn on_sent(&mut self, now: Instant, bytes: u64) {
-        self.prev_total_sent = self.total_sent;
-        self.total_sent += bytes;
-        self.prev_sent_time = self.sent_time;
-        self.sent_time = Some(now);
+    pub(crate) fn on_sent(&mut self, now: Instant, _bytes: u64) {
+        if self.sends.back().is_some_and(|s| s.sent == now) {
+            // Same instant, same delivery state: one entry serves the whole batch.
+            return;
+        }
+        if self.sends.is_empty() {
+            // Nothing in flight: intervals start afresh rather than spanning the idle time.
+            self.first_sent_time = Some(now);
+            self.delivered_time = Some(now);
+        }
+        if self.sends.len() == MAX_TRACKED_SENDS {
+            self.sends.pop_front();
+        }
+        self.sends.push_back(SendState {
+            sent: now,
+            delivered: self.delivered,
+            delivered_time: self.delivered_time.unwrap_or(now),
+            first_sent_time: self.first_sent_time.unwrap_or(now),
+        });
     }
 
-    pub(crate) fn on_ack(
-        &mut self,
-        now: Instant,
-        _sent: Instant,
-        bytes: u64,
-        round: u64,
-        app_limited: bool,
-    ) {
-        self.prev_total_acked = self.total_acked;
+    pub(crate) fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, min_rtt: Duration) {
         self.total_acked += bytes;
-        self.prev_acked_time = self.acked_time;
-        self.acked_time = Some(now);
-
-        let prev_sent_time = match self.prev_sent_time {
-            Some(prev_sent_time) => prev_sent_time,
-            None => return,
+        self.delivered += bytes;
+        self.delivered_time = Some(now);
+        // Sends older than this packet's are either acknowledged already, lost, or
+        // reordered behind it: none of them will give a sample worth more than this one.
+        while self.sends.front().is_some_and(|s| s.sent < sent) {
+            self.sends.pop_front();
+        }
+        let Some(state) = self.sends.front().copied().filter(|s| s.sent == sent) else {
+            return;
         };
-
-        let send_rate = match self.sent_time {
-            Some(sent_time) if sent_time > prev_sent_time => Self::bw_from_delta(
-                self.total_sent - self.prev_total_sent,
-                sent_time - prev_sent_time,
-            )
-            .unwrap_or(0),
-            _ => u64::MAX, // will take the min of send and ack, so this is just a skip
+        self.first_sent_time = Some(sent);
+        let send_elapsed = sent.saturating_duration_since(state.first_sent_time);
+        let ack_elapsed = now.saturating_duration_since(state.delivered_time);
+        let interval = send_elapsed.max(ack_elapsed);
+        // An interval shorter than the path's round trip is ACK compression, not a rate.
+        if interval.is_zero() || interval < min_rtt {
+            return;
+        }
+        let Some(bytes_per_second) =
+            Self::bw_from_delta(self.delivered - state.delivered, interval)
+        else {
+            return;
         };
-
-        let ack_rate = match self.prev_acked_time {
-            Some(prev_acked_time) => Self::bw_from_delta(
-                self.total_acked - self.prev_total_acked,
-                now - prev_acked_time,
-            )
-            .unwrap_or(0),
-            None => 0,
-        };
-
-        let bandwidth = send_rate.min(ack_rate);
-        // Mirror Chromium/quiche's admission rule: non-app-limited samples
-        // always feed the windowed max filter (feeding lower samples too is
-        // what lets the window rotate and the estimate decay); app-limited
-        // samples are admitted only when they RAISE the estimate, because a
-        // path cannot fake delivering faster than it can, while a low
-        // app-limited sample says nothing about capacity. Gating app-limited
-        // samples out entirely left the filter empty on connections that are
-        // app-limited from birth (a tunnel trickling below link rate), and a
-        // zero estimate collapses the ack-aggregation epoch arithmetic into
-        // unbounded excess_acked growth. Zero-rate artifacts (same-instant
-        // deltas) are never admitted.
-        if bandwidth > 0 && (!app_limited || bandwidth > self.max_filter.get()) {
-            self.max_filter.update_max(round, bandwidth);
+        if self
+            .pending
+            .is_none_or(|p| state.delivered >= p.prior_delivered)
+        {
+            self.pending = Some(RateSample {
+                prior_delivered: state.delivered,
+                bytes_per_second,
+            });
         }
     }
 
@@ -82,8 +110,18 @@ impl BandwidthEstimation {
         self.total_acked - self.acked_at_last_window
     }
 
-    pub(crate) fn end_acks(&mut self, _current_round: u64, _app_limited: bool) {
+    pub(crate) fn end_acks(&mut self, round: u64, app_limited: bool) {
         self.acked_at_last_window = self.total_acked;
+        let Some(sample) = self.pending.take() else {
+            return;
+        };
+        // quiche's admission rule: a non-app-limited sample always feeds the windowed
+        // max filter, which is also what lets the estimate decay; an app-limited one only
+        // when it raises it, since a sender short of data says nothing about capacity.
+        let rate = sample.bytes_per_second;
+        if rate > 0 && (!app_limited || rate > self.max_filter.get()) {
+            self.max_filter.update_max(round, rate);
+        }
     }
 
     pub(crate) fn get_estimate(&self) -> u64 {
