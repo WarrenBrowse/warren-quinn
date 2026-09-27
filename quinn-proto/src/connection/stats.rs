@@ -162,9 +162,10 @@ pub struct PathStats {
 /// Statistics about the outgoing application-datagram queue
 ///
 /// Datagrams queued by `send_datagram` wait in a send buffer until the
-/// connection can transmit them. Both counters here are drops that happen
-/// silently from the sender's point of view (`send_datagram` returned `Ok`),
-/// so they are the only visibility an application has into queue pressure.
+/// connection can transmit them. The `dropped_*` counters are drops that
+/// happen silently from the sender's point of view (`send_datagram` returned
+/// `Ok`), so they are the only visibility an application has into queue
+/// pressure.
 #[derive(Default, Debug, Copy, Clone)]
 #[non_exhaustive]
 pub struct DatagramTxStats {
@@ -172,6 +173,16 @@ pub struct DatagramTxStats {
     pub dropped_overflow: u64,
     /// Datagrams head-dropped by the CoDel AQM (queue sojourn above target)
     pub dropped_aqm: u64,
+    /// Datagrams sent ahead of the fair-queue schedule because the
+    /// scheduler's choice would have left them `max_reorder` or more
+    /// positions behind the newest datagram sent
+    ///
+    /// Not a drop: a non-zero rate says per-flow scheduling is being traded
+    /// for enqueue order to stay inside the configured reorder bound.
+    pub reorder_forced: u64,
+    /// Datagrams dropped instead of being sent ahead of the fair-queue
+    /// schedule, because they had already waited past the AQM target
+    pub dropped_reorder: u64,
     /// Datagrams accepted into the send buffer whose inner packet was Not-ECT
     ///
     /// The four `ecn_*` counters record the ECN codepoint distribution of the

@@ -869,6 +869,7 @@ pub struct DatagramAqmConfig {
     pub(crate) target: Duration,
     pub(crate) interval: Duration,
     pub(crate) flow_queues: usize,
+    pub(crate) max_reorder: Option<u64>,
 }
 
 impl DatagramAqmConfig {
@@ -905,6 +906,27 @@ impl DatagramAqmConfig {
         self.flow_queues = value.max(1);
         self
     }
+
+    /// Bound on how far per-flow scheduling may reorder datagrams, counted in
+    /// datagrams of the connection-wide enqueue order.
+    ///
+    /// Fair queueing lets a sparse flow overtake a bulk flow's backlog, which
+    /// sends datagrams out of their enqueue order. A receiver that gates
+    /// datagrams with a sliding anti-replay window (RFC 6479: IPsec, DTLS,
+    /// tunnels that number their frames) discards any datagram that arrives
+    /// more than its window behind the newest one it has seen, so an
+    /// unbounded reorder turns fairness into loss of the overtaken flow.
+    /// With `Some(n)`, a queued datagram is never left `n` or more positions
+    /// behind the newest datagram sent: when the scheduler's next choice
+    /// would do that, the oldest queued datagram goes first instead.
+    ///
+    /// Defaults to 768: three quarters of a 1024-packet window, the rest left
+    /// for reordering on the path. `None` lets the scheduler reorder without
+    /// limit. `Some(0)` is clamped to `Some(1)`, strict enqueue order.
+    pub fn max_reorder(&mut self, value: Option<u64>) -> &mut Self {
+        self.max_reorder = value.map(|n| n.max(1));
+        self
+    }
 }
 
 impl Default for DatagramAqmConfig {
@@ -913,6 +935,7 @@ impl Default for DatagramAqmConfig {
             target: Duration::from_millis(15),
             interval: Duration::from_millis(100),
             flow_queues: 1024,
+            max_reorder: Some(768),
         }
     }
 }
