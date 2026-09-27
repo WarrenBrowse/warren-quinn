@@ -682,7 +682,7 @@ impl DatagramState {
     /// behind the newest one sent, the oldest queued datagram is served
     /// first, charged to its own flow's DRR credit. It is dropped instead
     /// when it has already waited past the AQM target and its flow holds at
-    /// least as much backlog as the one DRR picked.
+    /// least its fair share of the queued bytes.
     pub(super) fn write(
         &mut self,
         buf: &mut Vec<u8>,
@@ -740,13 +740,15 @@ impl DatagramState {
                 .and_then(|config| config.max_reorder)
                 .and_then(|max_reorder| self.reorder_override(head, max_reorder))
                 .unwrap_or(bucket);
-            // Only the flow holding at least as much backlog as the one DRR
-            // picked may lose its stale head to the bound: a thin flow left
-            // oldest (its elders were evicted from a bulk flow, or the sender
-            // stalled) is sent out of turn instead, never made the victim.
-            let forced_is_fatter = served != bucket
-                && self.flows.get(&served).map(|f| f.bytes)
-                    >= self.flows.get(&bucket).map(|f| f.bytes);
+            // Only a flow holding at least its fair share of the queued bytes
+            // (RFC 8290's overlimit victim: the one building the backlog) may
+            // lose its stale head to the bound. A thin flow left oldest (its
+            // elders were evicted from a bulk flow, or the sender stalled) is
+            // sent out of turn instead, whichever flow DRR picked.
+            let forced_is_backlogged = served != bucket
+                && self.flows.get(&served).is_some_and(|f| {
+                    f.bytes.saturating_mul(self.flows.len()) >= self.outgoing_total
+                });
             let flow = self
                 .flows
                 .get_mut(&served)
@@ -763,7 +765,7 @@ impl DatagramState {
                 // is stale by the AQM's own standard, and sending it would
                 // push that flow over target too, where its own CoDel punishes
                 // it for a backlog it did not build: drop it instead.
-                if forced_is_fatter && sojourn >= config.target {
+                if forced_is_backlogged && sojourn >= config.target {
                     self.outgoing_total -= queued.datagram.data.len();
                     self.outgoing_count -= 1;
                     flow.bytes -= queued.datagram.data.len();
@@ -1742,6 +1744,38 @@ mod tests {
         assert_eq!(sent_ordinal(&buf), 1, "the sparse datagram goes out first");
         assert_eq!(stats.dropped_reorder, 0, "a thin flow is never the victim");
         assert_eq!(stats.reorder_forced, 1);
+    }
+
+    #[test]
+    fn a_thin_flow_is_not_the_victim_when_an_even_thinner_flow_is_picked() {
+        // Two thin flows beside a bulk flow: DRR picks the thinnest (a ping),
+        // and the oldest queued datagram belongs to the other thin flow. That
+        // flow holds more bytes than the ping, but far less than its share of
+        // the backlog: it is not the one overloading the queue, so it is sent.
+        let config = aqm();
+        let mut state = DatagramState::default();
+        let mut stats = DatagramTxStats::default();
+        let start = Instant::now();
+        push_ordinal(&mut state, 3, 0, 88, start);
+        let mut buf = Vec::new();
+        assert!(state.write(&mut buf, usize::MAX, start, Some(&config), &mut stats));
+        push_ordinal(&mut state, 2, 1, 200, start);
+        for ordinal in 2..802 {
+            push_ordinal(&mut state, 1, ordinal, 1200, start);
+        }
+        push_ordinal(&mut state, 3, 802, 88, start);
+        for _ in 0..770 {
+            assert_eq!(state.evict_from_fattest_flow(), Some(1200));
+        }
+        let late = start + config.target * 2;
+        let mut buf = Vec::new();
+        assert!(state.write(&mut buf, usize::MAX, late, Some(&config), &mut stats));
+        assert_eq!(
+            sent_ordinal(&buf),
+            1,
+            "the thin flow's datagram goes out first"
+        );
+        assert_eq!(stats.dropped_reorder, 0);
     }
 
     #[test]
