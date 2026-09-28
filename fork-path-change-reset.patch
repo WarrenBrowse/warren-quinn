@@ -1,0 +1,684 @@
+diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
+index 53f76750..46a9d051 100644
+--- a/quinn-proto/src/connection/mod.rs
++++ b/quinn-proto/src/connection/mod.rs
+@@ -1505,6 +1505,11 @@ impl Connection {
+         if ack.largest >= self.spaces[space].next_packet_number {
+             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
+         }
++        let generation = self.path.generation();
++        // Whether the newly largest acknowledged packet was sent on the current path: one sent
++        // before a path change took part of its round trip on the old path, and RFC 9000
++        // section 9.4 keeps it out of the new path's RTT estimate
++        let mut largest_on_path = false;
+         let new_largest = {
+             let space = &mut self.spaces[space];
+             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
+@@ -1514,6 +1519,7 @@ impl Connection {
+                     // haven't sent. At worst, that will result in us spuriously reducing the
+                     // congestion window.
+                     space.largest_acked_packet_sent = info.time_sent;
++                    largest_on_path = info.path_generation == generation;
+                 }
+                 true
+             } else {
+@@ -1569,7 +1575,7 @@ impl Connection {
+             self.spaces[space].largest_acked_packet,
+         );
+ 
+-        if new_largest && ack_eliciting_acked {
++        if new_largest && ack_eliciting_acked && largest_on_path {
+             let ack_delay = if space != SpaceId::Data {
+                 Duration::from_micros(0)
+             } else {
+@@ -1645,10 +1651,13 @@ impl Connection {
+     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
+     // high-latency handshakes
+     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
++        let on_path = info.path_generation == self.path.generation();
+         self.remove_in_flight(&info);
+-        if info.ack_eliciting && self.path.challenge.is_none() {
++        if on_path && info.ack_eliciting && self.path.challenge.is_none() {
+             // Only pass ACKs to the congestion controller if we are not validating the current
+-            // path, so as to ignore any ACKs from older paths still coming in.
++            // path, so as to ignore any ACKs from older paths still coming in, and only for a
++            // packet sent on the current path: one sent before a path change is not a
++            // delivery on the new path (RFC 9000 section 9.4).
+             self.path.congestion.on_ack(
+                 now,
+                 info.time_sent,
+@@ -3146,6 +3155,25 @@ impl Connection {
+         self.ping();
+     }
+ 
++    /// Handle an active migration that moved the local end of the path to another IP address
++    ///
++    /// Does what [`Self::local_address_changed`] does, and restarts the path's congestion
++    /// controller and RTT estimator from their initial values: a different local address is a
++    /// different network path, whose round trip and capacity the old path's state says nothing
++    /// about (RFC 9000 section 9.4). A connection that kept them would size its window on the
++    /// old path's round trip, a few kilobytes on a path born sub-millisecond and moved to one of
++    /// tens of milliseconds. Packets sent before the move are acknowledged and declared lost as
++    /// usual but feed neither the new controller nor the new RTT estimator.
++    ///
++    /// Use [`Self::local_address_changed`] when the local IP address is unchanged (a rebind to
++    /// another port), which stays on the same path.
++    pub fn local_path_changed(&mut self, now: Instant) {
++        self.path_counter = self.path_counter.wrapping_add(1);
++        self.path
++            .restart_congestion(self.path_counter, now, &self.config);
++        self.local_address_changed();
++    }
++
+     /// Switch to a previously unused remote connection ID, if possible
+     fn update_rem_cid(&mut self) {
+         let (reset_token, retired) = match self.rem_cids.next() {
+diff --git a/quinn-proto/src/connection/paths.rs b/quinn-proto/src/connection/paths.rs
+index 1488575c..37b3a136 100644
+--- a/quinn-proto/src/connection/paths.rs
++++ b/quinn-proto/src/connection/paths.rs
+@@ -154,6 +154,38 @@ impl PathData {
+         );
+     }
+ 
++    /// Restarts the congestion state for a new network path under the same peer address
++    ///
++    /// RFC 9000 section 9.4: packets sent on the old path must not contribute to congestion
++    /// control or RTT estimation for the new one. The RTT estimator, the congestion controller,
++    /// the pacer and the in-flight accounting start over under `generation`, so a packet sent
++    /// before the restart no longer counts toward the new path's bytes in flight, its
++    /// congestion signals or its RTT samples. The MTU is kept: the black hole detector lowers it
++    /// if the new path is narrower, where restarting it would refuse every datagram above the
++    /// initial MTU until discovery has run again.
++    pub(super) fn restart_congestion(
++        &mut self,
++        generation: u64,
++        now: Instant,
++        config: &TransportConfig,
++    ) {
++        self.rtt = RttEstimator::new(config.initial_rtt);
++        self.congestion = config
++            .congestion_controller_factory
++            .clone()
++            .build(now, self.current_mtu());
++        self.pacing = Pacer::new(
++            config.initial_rtt,
++            self.congestion.initial_window(),
++            self.current_mtu(),
++            now,
++        );
++        self.in_flight = InFlight::new();
++        self.first_packet = None;
++        self.first_packet_after_rtt_sample = None;
++        self.generation = generation;
++    }
++
+     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
+     /// received enough data from the peer to permit sending `bytes_to_send` additional bytes
+     pub(super) fn anti_amplification_blocked(&self, bytes_to_send: u64) -> bool {
+diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
+index 8f2fb4b4..3f4caaa0 100644
+--- a/quinn-proto/src/tests/mod.rs
++++ b/quinn-proto/src/tests/mod.rs
+@@ -38,6 +38,8 @@ use util::*;
+ 
+ mod token;
+ 
++mod path_change;
++
+ #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+ use wasm_bindgen_test::wasm_bindgen_test as test;
+ 
+diff --git a/quinn-proto/src/tests/path_change.rs b/quinn-proto/src/tests/path_change.rs
+new file mode 100644
+index 00000000..38593de4
+--- /dev/null
++++ b/quinn-proto/src/tests/path_change.rs
+@@ -0,0 +1,324 @@
++//! Congestion state across a change of network path
++//!
++//! A connection formed on one path and moved to another (a client that changes networks, or
++//! rebinds onto another interface) must not carry the old path's round trip and window onto the
++//! new one: RFC 9000 section 9.4 asks for the congestion controller and the RTT estimator to
++//! restart from their initial values, unless only the port changed. BBR sizes its window as
++//! `bw x min_rtt`, so a `min_rtt` kept from a 0.5 ms path holds a 40 ms path to a few Mbit/s.
++//!
++//! The connection forms on a 0.5 ms path, the client moves to another address whose path has
++//! a 40 ms round trip, and a greedy datagram source (a tunnel carrying a bulk download) then
++//! runs over a simulated 20 Mbit/s bottleneck with a 5 ms tail-drop queue. Datagrams are
++//! 1100 bytes: a loss burst can make the black hole detector drop the MTU to its 1200-byte
++//! floor, where a 1200-byte datagram no longer fits, and that stall is not what these tests
++//! are about.
++//! `PATH_CHANGE_TRACE=1` prints the sender's state every simulated second.
++
++use std::{
++    net::{Ipv4Addr, SocketAddr},
++    sync::Arc,
++};
++
++use bytes::Bytes;
++
++use super::util::*;
++use crate::{ConnectionHandle, Duration, TransportConfig, VarInt, congestion::BbrConfig};
++
++const PAYLOAD: usize = 1100;
++const LINK_RATE: u64 = 20_000_000;
++const SHORT_ONE_WAY: Duration = Duration::from_micros(250);
++const LONG_ONE_WAY: Duration = Duration::from_millis(20);
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum Sender {
++    Client,
++    Server,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Source {
++    /// Keep-alive pings only, as a tunnel carries between two downloads
++    Idle,
++    /// A greedy source that keeps the datagram queue full, so the congestion window alone sets
++    /// the rate
++    Greedy,
++}
++
++fn transport() -> TransportConfig {
++    let mut bbr = BbrConfig::default();
++    bbr.initial_window(32 * 1200);
++    let mut transport = TransportConfig::default();
++    transport
++        .congestion_controller_factory(Arc::new(bbr))
++        .datagram_send_buffer_size(1024 * 1024)
++        .datagram_receive_buffer_size(Some(64 * 1024 * 1024))
++        .receive_window(VarInt::from_u32(u32::MAX >> 2));
++    transport
++}
++
++fn address(ip: [u8; 4]) -> SocketAddr {
++    SocketAddr::new(
++        Ipv4Addr::from(ip).into(),
++        CLIENT_PORTS.lock().unwrap().next().unwrap(),
++    )
++}
++
++/// A connected pair on the short path, the client at `192.0.2.10`
++fn connected() -> (Pair, ConnectionHandle, ConnectionHandle) {
++    let mut server = server_config();
++    server.transport = Arc::new(transport());
++    let mut pair = Pair::new(Default::default(), server);
++    pair.client.addr = address([192, 0, 2, 10]);
++    pair.latency = SHORT_ONE_WAY;
++    // The receiver reads the link every millisecond, as a real host's interrupt coalescing
++    // does, rather than packet by packet
++    let link =
++        || Link::new(LINK_RATE, Duration::from_millis(5)).with_batch(Duration::from_millis(1));
++    pair.client_to_server_link = Some(link());
++    pair.server_to_client_link = Some(link());
++    let mut client = client_config();
++    client.transport_config(Arc::new(transport()));
++    let (client_ch, server_ch) = pair.connect_with(client);
++    (pair, client_ch, server_ch)
++}
++
++/// Runs `source` from `sender` for `secs` seconds and returns the goodput the receiver saw in
++/// each of them, in bits per second
++fn pump(
++    pair: &mut Pair,
++    client_ch: ConnectionHandle,
++    server_ch: ConnectionHandle,
++    sender: Sender,
++    source: Source,
++    secs: u64,
++) -> Vec<u64> {
++    let payload = Bytes::from(vec![0u8; PAYLOAD]);
++    let start = pair.time;
++    let mut per_second = vec![0u64; secs as usize];
++    let mut last_report = usize::MAX;
++    let mut last_ping = start;
++    while pair.time < start + Duration::from_secs(secs) {
++        let now = pair.time;
++        match source {
++            Source::Idle => {
++                if now >= last_ping + Duration::from_millis(100) {
++                    last_ping = now;
++                    match sender {
++                        Sender::Client => pair.client_conn_mut(client_ch).ping(),
++                        Sender::Server => pair.server_conn_mut(server_ch).ping(),
++                    }
++                }
++            }
++            Source::Greedy => {
++                let mut datagrams = match sender {
++                    Sender::Client => pair.client_datagrams(client_ch),
++                    Sender::Server => pair.server_datagrams(server_ch),
++                };
++                while datagrams.send_buffer_space() >= 2 * PAYLOAD {
++                    if datagrams.send(payload.clone(), false, now).is_err() {
++                        break;
++                    }
++                }
++            }
++        }
++        let before = pair.time;
++        let mut steps = 0;
++        while pair.time == before && steps < 64 {
++            pair.step();
++            steps += 1;
++        }
++        // The source must be polled even while the connection has nothing to do
++        let cap = before + Duration::from_micros(500);
++        pair.time = pair.time.min(cap).max(before + Duration::from_micros(1));
++        let second = pair.time.saturating_duration_since(start).as_secs() as usize;
++        loop {
++            let datagram = match sender {
++                Sender::Client => pair.server_datagrams(server_ch).recv(),
++                Sender::Server => pair.client_datagrams(client_ch).recv(),
++            };
++            let Some(datagram) = datagram else { break };
++            if second < per_second.len() {
++                per_second[second] += datagram.len() as u64 * 8;
++            }
++        }
++        if second != last_report && std::env::var_os("PATH_CHANGE_TRACE").is_some() {
++            last_report = second;
++            let stats = match sender {
++                Sender::Client => pair.client_conn_mut(client_ch).stats(),
++                Sender::Server => pair.server_conn_mut(server_ch).stats(),
++            };
++            println!(
++                "  {sender:?} t={second}s cwnd={} rtt={:?} min_rtt={:?} sent={} lost={}",
++                stats.path.cwnd,
++                stats.path.rtt,
++                stats.path.min_rtt,
++                stats.path.sent_packets,
++                stats.path.lost_packets,
++            );
++        }
++    }
++    per_second
++}
++
++fn mean_from(per_second: &[u64], from: usize) -> u64 {
++    let tail = &per_second[from..];
++    tail.iter().sum::<u64>() / tail.len() as u64
++}
++
++fn mbit(per_second: &[u64]) -> Vec<String> {
++    per_second
++        .iter()
++        .map(|b| format!("{:.1}", *b as f64 / 1e6))
++        .collect()
++}
++
++/// The client moves to another address, on a path with a 40 ms round trip, and tells the
++/// connection its local path changed, as `quinn::Endpoint::rebind` does for a socket bound to
++/// another address
++fn move_client_to_a_longer_path(pair: &mut Pair, client_ch: ConnectionHandle) {
++    pair.client.addr = address([198, 51, 100, 20]);
++    pair.latency = LONG_ONE_WAY;
++    let now = pair.time;
++    pair.client_conn_mut(client_ch).local_path_changed(now);
++}
++
++/// The collapse the 2026-09-27 Hetzner bench measured through the tunnel (4 Mbit/s on a
++/// 40 ms path for a connection born on a sub-millisecond one), on the uplink, where the
++/// client is the sender and its own congestion state is the one that must restart
++#[test]
++fn a_client_that_moves_to_a_longer_path_sizes_its_window_for_it() {
++    let (mut pair, client_ch, server_ch) = connected();
++    pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Client,
++        Source::Idle,
++        1,
++    );
++
++    move_client_to_a_longer_path(&mut pair, client_ch);
++    let after = pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Client,
++        Source::Greedy,
++        6,
++    );
++    let stats = pair.client_conn_mut(client_ch).stats();
++    assert!(
++        mean_from(&after, 2) >= LINK_RATE * 8 / 10,
++        "a greedy uplink over a {} Mbit/s path must fill it once the client has moved to it, \
++         got {:?} Mbit/s per second (client min_rtt {:?}, cwnd {})",
++        LINK_RATE / 1_000_000,
++        mbit(&after),
++        stats.path.min_rtt,
++        stats.path.cwnd
++    );
++}
++
++/// Packets sent on the old path and acknowledged after the move took half of their round trip
++/// on the old path: RFC 9000 section 9.4 forbids them from contributing to the new path's RTT
++/// estimate, and a `min_rtt` taken from them would hold the window at half the path's BDP
++#[test]
++fn packets_sent_before_a_move_do_not_sample_the_new_path() {
++    let (mut pair, client_ch, server_ch) = connected();
++    pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Client,
++        Source::Greedy,
++        1,
++    );
++
++    move_client_to_a_longer_path(&mut pair, client_ch);
++    pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Client,
++        Source::Greedy,
++        1,
++    );
++    let min_rtt = pair.client_conn_mut(client_ch).stats().path.min_rtt;
++    assert!(
++        min_rtt >= 2 * LONG_ONE_WAY,
++        "the new path's min_rtt must be one of its own round trips (at least {:?}), got {min_rtt:?}",
++        2 * LONG_ONE_WAY
++    );
++}
++
++/// The server's side of the same move: it sees its peer arrive from another IP address and
++/// restarts on its own (upstream's `migrate`); a regression guard for the downlink
++#[test]
++fn a_server_whose_client_moves_to_a_longer_path_sizes_its_window_for_it() {
++    let (mut pair, client_ch, server_ch) = connected();
++    pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Server,
++        Source::Idle,
++        1,
++    );
++
++    move_client_to_a_longer_path(&mut pair, client_ch);
++    let after = pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Server,
++        Source::Greedy,
++        6,
++    );
++    assert!(
++        mean_from(&after, 2) >= LINK_RATE * 8 / 10,
++        "a greedy downlink must fill the path once the client has moved, got {:?}",
++        mbit(&after)
++    );
++}
++
++/// A rebind that keeps the IP address and changes only the port stays on the same path, and a
++/// NAT rebinding looks the same to the server: RFC 9000 section 9.4 lets both keep their
++/// congestion state, and restarting it would cost a slow start for nothing
++#[test]
++fn a_rebind_on_the_same_address_keeps_the_congestion_state() {
++    let (mut pair, client_ch, server_ch) = connected();
++    pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Client,
++        Source::Greedy,
++        1,
++    );
++    let client_before = pair.client_conn_mut(client_ch).stats().path;
++    let server_min_rtt_before = pair.server_conn_mut(server_ch).stats().path.min_rtt;
++
++    let ip = pair.client.addr.ip();
++    pair.client.addr = SocketAddr::new(ip, CLIENT_PORTS.lock().unwrap().next().unwrap());
++    pair.client_conn_mut(client_ch).local_address_changed();
++    let client_after = pair.client_conn_mut(client_ch).stats().path;
++    assert_eq!(client_after.min_rtt, client_before.min_rtt);
++    assert_eq!(client_after.cwnd, client_before.cwnd);
++
++    pump(
++        &mut pair,
++        client_ch,
++        server_ch,
++        Sender::Client,
++        Source::Greedy,
++        1,
++    );
++    assert_eq!(
++        pair.server_conn_mut(server_ch).remote_address(),
++        pair.client.addr
++    );
++    assert_eq!(
++        pair.server_conn_mut(server_ch).stats().path.min_rtt,
++        server_min_rtt_before,
++        "a NAT rebinding must keep the server's RTT estimate"
++    );
++}
+diff --git a/quinn-proto/src/tests/util.rs b/quinn-proto/src/tests/util.rs
+index fd61e611..1f96bfd8 100644
+--- a/quinn-proto/src/tests/util.rs
++++ b/quinn-proto/src/tests/util.rs
+@@ -39,6 +39,10 @@ pub(super) struct Pair {
+     pub(super) congestion_experienced: bool,
+     // One-way
+     pub(super) latency: Duration,
++    /// Bottleneck on the client-to-server direction, `None` for an infinitely fast link
++    pub(super) client_to_server_link: Option<Link>,
++    /// Bottleneck on the server-to-client direction, `None` for an infinitely fast link
++    pub(super) server_to_client_link: Option<Link>,
+     /// Number of spin bit flips
+     pub(super) spins: u64,
+     last_spin: bool,
+@@ -82,6 +86,8 @@ impl Pair {
+             time: now,
+             mtu: DEFAULT_MTU,
+             latency: Duration::ZERO,
++            client_to_server_link: None,
++            server_to_client_link: None,
+             spins: 0,
+             last_spin: false,
+             congestion_experienced: false,
+@@ -157,8 +163,15 @@ impl Pair {
+             }
+             if self.server.addr == packet.destination {
+                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
++                let departure = match self.client_to_server_link.as_mut() {
++                    Some(link) => match link.enqueue(self.time, packet_size) {
++                        Some(departure) => departure,
++                        None => continue,
++                    },
++                    None => self.time,
++                };
+                 self.server.inbound.push_back((
+-                    self.time + self.latency,
++                    departure + self.latency,
+                     ecn,
+                     buffer.as_ref().into(),
+                 ));
+@@ -181,8 +194,15 @@ impl Pair {
+             }
+             if self.client.addr == packet.destination {
+                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
++                let departure = match self.server_to_client_link.as_mut() {
++                    Some(link) => match link.enqueue(self.time, packet_size) {
++                        Some(departure) => departure,
++                        None => continue,
++                    },
++                    None => self.time,
++                };
+                 self.client.inbound.push_back((
+-                    self.time + self.latency,
++                    departure + self.latency,
+                     ecn,
+                     buffer.as_ref().into(),
+                 ));
+@@ -278,6 +298,65 @@ impl Pair {
+     }
+ }
+ 
++/// A bottleneck link: packets are serialized at `rate` bits per second behind a
++/// tail-drop queue holding at most `queue` of transmission time
++///
++/// When `batch` is set, the receiver only reads the link every `batch`: every packet that
++/// arrived in between is handed over at once, as interrupt coalescing and receive offload do
++/// on a real host. The link itself stays perfectly regular, with no jitter, as a netem delay
++/// line is.
++pub(super) struct Link {
++    rate: u64,
++    queue: Duration,
++    batch: Option<Duration>,
++    epoch: Option<Instant>,
++    busy_until: Option<Instant>,
++    pub(super) dropped: u64,
++}
++
++impl Link {
++    pub(super) fn new(rate: u64, queue: Duration) -> Self {
++        Self {
++            rate,
++            queue,
++            batch: None,
++            epoch: None,
++            busy_until: None,
++            dropped: 0,
++        }
++    }
++
++    pub(super) fn with_batch(mut self, batch: Duration) -> Self {
++        self.batch = Some(batch);
++        self
++    }
++
++    /// When the receiver sees a packet that left the link at `departure`
++    fn delivery(&mut self, departure: Instant) -> Instant {
++        let Some(batch) = self.batch else {
++            return departure;
++        };
++        let epoch = *self.epoch.get_or_insert(departure);
++        let since = departure.saturating_duration_since(epoch).as_nanos();
++        let batch_ns = batch.as_nanos().max(1);
++        let slots = since.div_ceil(batch_ns);
++        epoch + Duration::from_nanos((slots * batch_ns) as u64)
++    }
++
++    /// The instant the receiver sees the packet, or `None` when the queue drops it
++    fn enqueue(&mut self, now: Instant, size: usize) -> Option<Instant> {
++        let start = self.busy_until.map_or(now, |busy| busy.max(now));
++        if start.saturating_duration_since(now) > self.queue {
++            self.dropped += 1;
++            return None;
++        }
++        let serialization = Duration::from_nanos(size as u64 * 8 * 1_000_000_000 / self.rate);
++        let departure = start + serialization;
++        self.busy_until = Some(departure);
++        Some(self.delivery(departure))
++    }
++}
++
+ impl Default for Pair {
+     fn default() -> Self {
+         Self::new(Default::default(), server_config())
+diff --git a/quinn/src/connection.rs b/quinn/src/connection.rs
+index 69b59203..0b434b7e 100644
+--- a/quinn/src/connection.rs
++++ b/quinn/src/connection.rs
+@@ -1135,9 +1135,15 @@ impl State {
+         loop {
+             match self.conn_events.poll_recv(cx) {
+                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
++                    let moved =
++                        rebind_moves_path(self.socket.local_addr().ok(), socket.local_addr().ok());
+                     self.socket = socket;
+                     self.io_poller = self.socket.clone().create_io_poller();
+-                    self.inner.local_address_changed();
++                    if moved {
++                        self.inner.local_path_changed(self.runtime.now());
++                    } else {
++                        self.inner.local_address_changed();
++                    }
+                 }
+                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
+                     self.inner.handle_event(event);
+@@ -1384,3 +1390,77 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 80;
+ // under the kernel UDP_MAX_SEGMENTS=64 ceiling. Total GSO payload per
+ // sendmsg must stay < u16::MAX (holds for MTU <= 1638 * 40 segments).
+ const MAX_TRANSMIT_SEGMENTS: usize = 40;
++
++/// Whether a rebind from a socket bound to `old` to one bound to `new` moves the connection
++/// onto another network path
++///
++/// Only two sockets bound to the same specific IP address share a path (a new port, which is
++/// what a NAT rebinding looks like to the peer). The source address of a wildcard socket is
++/// chosen per packet from the routing table, so a rebind to or from one can land on any
++/// interface and counts as a path change, as does a local address that cannot be read: RFC
++/// 9000 section 9.4 keeps congestion state across a path change only when the endpoint knows
++/// the path is the same.
++fn rebind_moves_path(old: Option<SocketAddr>, new: Option<SocketAddr>) -> bool {
++    match (old, new) {
++        (Some(old), Some(new)) => old.ip().is_unspecified() || old.ip() != new.ip(),
++        _ => true,
++    }
++}
++
++#[cfg(test)]
++mod rebind_tests {
++    use std::net::SocketAddr;
++
++    use super::rebind_moves_path;
++
++    fn addr(s: &str) -> Option<SocketAddr> {
++        Some(s.parse().unwrap())
++    }
++
++    #[test]
++    fn a_new_port_on_the_same_address_stays_on_the_path() {
++        assert!(!rebind_moves_path(
++            addr("192.0.2.1:4433"),
++            addr("192.0.2.1:5000")
++        ));
++        assert!(!rebind_moves_path(
++            addr("[2001:db8::1]:4433"),
++            addr("[2001:db8::1]:5000")
++        ));
++    }
++
++    #[test]
++    fn another_address_is_another_path() {
++        assert!(rebind_moves_path(
++            addr("192.0.2.1:4433"),
++            addr("198.51.100.1:4433")
++        ));
++        assert!(rebind_moves_path(
++            addr("192.0.2.1:4433"),
++            addr("[2001:db8::1]:4433")
++        ));
++    }
++
++    #[test]
++    fn a_wildcard_socket_may_be_on_any_path() {
++        assert!(rebind_moves_path(
++            addr("0.0.0.0:4433"),
++            addr("0.0.0.0:5000")
++        ));
++        assert!(rebind_moves_path(addr("[::]:4433"), addr("[::]:5000")));
++        assert!(rebind_moves_path(
++            addr("192.0.2.1:4433"),
++            addr("0.0.0.0:5000")
++        ));
++        assert!(rebind_moves_path(
++            addr("0.0.0.0:4433"),
++            addr("192.0.2.1:5000")
++        ));
++    }
++
++    #[test]
++    fn an_unreadable_local_address_counts_as_a_move() {
++        assert!(rebind_moves_path(None, addr("192.0.2.1:4433")));
++        assert!(rebind_moves_path(addr("192.0.2.1:4433"), None));
++    }
++}

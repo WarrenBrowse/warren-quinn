@@ -259,6 +259,47 @@ old tags are unaffected; only `main` was rebuilt.
      every `interval` (600 s by default), so a PMTU that settled too low
      recovers without help.
 
+10. **A rebind to another local address restarts the path's congestion state**
+    (`Connection::local_path_changed`, called by `quinn`'s rebind handler).
+    Upstream keeps the congestion controller and the RTT estimator across
+    `Endpoint::rebind` (`local_address_changed` only rotates the CID and
+    pings), so a connection formed on one network and moved to another keeps
+    the old path's round trip. BBR sizes its window as `bw x min_rtt` and reads
+    `min_rtt` from the estimator's lifetime minimum: a client whose tunnel was
+    born on a 0.4 ms path and moved to a 40 ms one kept a window of a few
+    kilobytes and uploaded at 6.1 Mbit/s against 292 once restarted over the
+    first 30 s after the move (Hetzner A/B, n=8,
+    `warren-core/bench/results/2026-09-28_quinn-path-change_hetzner_migration-ab.md`).
+    RFC 9000 section 9.4: "Packets sent on the old path MUST NOT contribute to
+    congestion control or RTT estimation for the new path", and state may be
+    kept only when the change is known to be port-only.
+
+    The rule: `quinn` compares the old and the new socket's local address;
+    two sockets bound to the same specific IP stay on the same path (a new
+    port, what a NAT rebinding is to the peer) and keep everything, any other
+    rebind (another IP, a wildcard socket whose source the routing table picks
+    per packet, an unreadable address) calls `local_path_changed`. That
+    restarts the RTT estimator, the controller, the pacer and the in-flight
+    accounting under a new path generation, and keeps the MTU (the black hole
+    detector lowers it if the new path is narrower, where restarting it would
+    refuse every datagram above the initial MTU until discovery runs again).
+    Two gates make the old path's packets inert: an ACK passes a packet to the
+    controller only if it was sent under the current generation, and the RTT
+    estimator only takes a sample from a newly largest acknowledged packet of
+    the current generation (a sample from a packet sent before the move took
+    half its round trip on the old path: 24.75 ms instead of 40 in the pair
+    test without this gate). The server side is upstream's and unchanged: a
+    peer that arrives from another IP gets a fresh `PathData`, a port-only
+    change on the same IPv4 keeps its state. `min_rtt` on a stable path is
+    untouched; the five BBR-internal candidates that tried to renew it are on
+    the `bench/bbr-*` branches with the reasons they were rejected.
+
+    Covered by `quinn-proto/src/tests/path_change.rs` (a 20 Mbit/s simulated
+    bottleneck: the uplink after a move collapses to 2 Mbit/s without the
+    restart; old-path packets must not sample the new path; the server's own
+    reset; a same-address rebind keeps state) and `connection::rebind_tests`
+    in `quinn` (the same-path rule).
+
 ## Patch files (portable form of the deltas)
 
 Each fork delta is also committed as an isolated patch at the repo root,
@@ -293,6 +334,10 @@ the primary upgrade path is now a plain `git rebase`.
   widening of `RttEstimator::new` the tests need landed upstream in
   `33ce0c21`, so it is no longer part of the fork delta. The same one-token
   STARTUP bug is present on upstream main.
+- `fork-path-change-reset.patch`: delta 10, `local_path_changed` and the
+  generation gates in `quinn-proto`, the rebind rule in `quinn`, the
+  bottleneck link model in the pair harness and the path-change tests
+  (fork-local).
 - `fork-datagram-fqcodel-bdp.patch`: the whole datagram send-queue delta
   (deltas 6-8): the AQM config and queue timestamping, FQ-CoDel per-flow
   queues + DRR, the `DatagramClass` classification API, the BDP-adaptive send
