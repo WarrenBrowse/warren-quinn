@@ -1505,6 +1505,11 @@ impl Connection {
         if ack.largest >= self.spaces[space].next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
+        let generation = self.path.generation();
+        // Whether the newly largest acknowledged packet was sent on the current path: one sent
+        // before a path change took part of its round trip on the old path, and RFC 9000
+        // section 9.4 keeps it out of the new path's RTT estimate
+        let mut largest_on_path = false;
         let new_largest = {
             let space = &mut self.spaces[space];
             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
@@ -1514,6 +1519,7 @@ impl Connection {
                     // haven't sent. At worst, that will result in us spuriously reducing the
                     // congestion window.
                     space.largest_acked_packet_sent = info.time_sent;
+                    largest_on_path = info.path_generation == generation;
                 }
                 true
             } else {
@@ -1569,7 +1575,7 @@ impl Connection {
             self.spaces[space].largest_acked_packet,
         );
 
-        if new_largest && ack_eliciting_acked {
+        if new_largest && ack_eliciting_acked && largest_on_path {
             let ack_delay = if space != SpaceId::Data {
                 Duration::from_micros(0)
             } else {
@@ -1645,10 +1651,13 @@ impl Connection {
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+        let on_path = info.path_generation == self.path.generation();
         self.remove_in_flight(&info);
-        if info.ack_eliciting && self.path.challenge.is_none() {
+        if on_path && info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
-            // path, so as to ignore any ACKs from older paths still coming in.
+            // path, so as to ignore any ACKs from older paths still coming in, and only for a
+            // packet sent on the current path: one sent before a path change is not a
+            // delivery on the new path (RFC 9000 section 9.4).
             self.path.congestion.on_ack(
                 now,
                 info.time_sent,
@@ -3144,6 +3153,25 @@ impl Connection {
     pub fn local_address_changed(&mut self) {
         self.update_rem_cid();
         self.ping();
+    }
+
+    /// Handle an active migration that moved the local end of the path to another IP address
+    ///
+    /// Does what [`Self::local_address_changed`] does, and restarts the path's congestion
+    /// controller and RTT estimator from their initial values: a different local address is a
+    /// different network path, whose round trip and capacity the old path's state says nothing
+    /// about (RFC 9000 section 9.4). A connection that kept them would size its window on the
+    /// old path's round trip, a few kilobytes on a path born sub-millisecond and moved to one of
+    /// tens of milliseconds. Packets sent before the move are acknowledged and declared lost as
+    /// usual but feed neither the new controller nor the new RTT estimator.
+    ///
+    /// Use [`Self::local_address_changed`] when the local IP address is unchanged (a rebind to
+    /// another port), which stays on the same path.
+    pub fn local_path_changed(&mut self, now: Instant) {
+        self.path_counter = self.path_counter.wrapping_add(1);
+        self.path
+            .restart_congestion(self.path_counter, now, &self.config);
+        self.local_address_changed();
     }
 
     /// Switch to a previously unused remote connection ID, if possible

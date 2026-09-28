@@ -1135,9 +1135,15 @@ impl State {
         loop {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
+                    let moved =
+                        rebind_moves_path(self.socket.local_addr().ok(), socket.local_addr().ok());
                     self.socket = socket;
                     self.io_poller = self.socket.clone().create_io_poller();
-                    self.inner.local_address_changed();
+                    if moved {
+                        self.inner.local_path_changed(self.runtime.now());
+                    } else {
+                        self.inner.local_address_changed();
+                    }
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
                     self.inner.handle_event(event);
@@ -1384,3 +1390,77 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 80;
 // under the kernel UDP_MAX_SEGMENTS=64 ceiling. Total GSO payload per
 // sendmsg must stay < u16::MAX (holds for MTU <= 1638 * 40 segments).
 const MAX_TRANSMIT_SEGMENTS: usize = 40;
+
+/// Whether a rebind from a socket bound to `old` to one bound to `new` moves the connection
+/// onto another network path
+///
+/// Only two sockets bound to the same specific IP address share a path (a new port, which is
+/// what a NAT rebinding looks like to the peer). The source address of a wildcard socket is
+/// chosen per packet from the routing table, so a rebind to or from one can land on any
+/// interface and counts as a path change, as does a local address that cannot be read: RFC
+/// 9000 section 9.4 keeps congestion state across a path change only when the endpoint knows
+/// the path is the same.
+fn rebind_moves_path(old: Option<SocketAddr>, new: Option<SocketAddr>) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) => old.ip().is_unspecified() || old.ip() != new.ip(),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use std::net::SocketAddr;
+
+    use super::rebind_moves_path;
+
+    fn addr(s: &str) -> Option<SocketAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn a_new_port_on_the_same_address_stays_on_the_path() {
+        assert!(!rebind_moves_path(
+            addr("192.0.2.1:4433"),
+            addr("192.0.2.1:5000")
+        ));
+        assert!(!rebind_moves_path(
+            addr("[2001:db8::1]:4433"),
+            addr("[2001:db8::1]:5000")
+        ));
+    }
+
+    #[test]
+    fn another_address_is_another_path() {
+        assert!(rebind_moves_path(
+            addr("192.0.2.1:4433"),
+            addr("198.51.100.1:4433")
+        ));
+        assert!(rebind_moves_path(
+            addr("192.0.2.1:4433"),
+            addr("[2001:db8::1]:4433")
+        ));
+    }
+
+    #[test]
+    fn a_wildcard_socket_may_be_on_any_path() {
+        assert!(rebind_moves_path(
+            addr("0.0.0.0:4433"),
+            addr("0.0.0.0:5000")
+        ));
+        assert!(rebind_moves_path(addr("[::]:4433"), addr("[::]:5000")));
+        assert!(rebind_moves_path(
+            addr("192.0.2.1:4433"),
+            addr("0.0.0.0:5000")
+        ));
+        assert!(rebind_moves_path(
+            addr("0.0.0.0:4433"),
+            addr("192.0.2.1:5000")
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_local_address_counts_as_a_move() {
+        assert!(rebind_moves_path(None, addr("192.0.2.1:4433")));
+        assert!(rebind_moves_path(addr("192.0.2.1:4433"), None));
+    }
+}
