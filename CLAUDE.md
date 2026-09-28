@@ -29,11 +29,13 @@ that diverges from upstream is a line someone re-resolves at the next re-sync.
 - **Nothing Warren-specific lands here.** No product policy, no Warren naming, no
   control-plane concept. If a change can live in `warrenguard`, it lives there.
 - **The delta is deliberately small and enumerable**: the authoritative
-  per-delta list is README.md section "Deltas vs upstream" (8 deltas as of
-  fork.12: the Initial-fragmentation knobs, GSO transmit sizing, socket-buffer
+  per-delta list is README.md section "Deltas vs upstream" (10 deltas as of
+  fork.15: the Initial-fragmentation knobs, GSO transmit sizing, socket-buffer
   autosizing, the Apple fast datapath, the BBR repair fixes, the FQ-CoDel
-  datagram send-queue AQM, the BDP-adaptive send buffer, and the inner-ECN
-  counters), each also committed as an isolated patch at the repo root. Adding
+  datagram send-queue AQM, the BDP-adaptive send buffer, the inner-ECN
+  counters, the probe-loss discriminant, and the congestion restart on a
+  rebind to another local address), each also committed as an isolated patch
+  at the repo root. Adding
   a delta needs a reason written down in that list.
 - **Since fork.8 the fork has a real git ancestry** on `upstream/0.11.x`
   (commit `33ce0c21` since fork.12): a re-sync is a `git rebase`, no longer a
