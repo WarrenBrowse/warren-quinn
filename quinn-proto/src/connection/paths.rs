@@ -154,6 +154,38 @@ impl PathData {
         );
     }
 
+    /// Restarts the congestion state for a new network path under the same peer address
+    ///
+    /// RFC 9000 section 9.4: packets sent on the old path must not contribute to congestion
+    /// control or RTT estimation for the new one. The RTT estimator, the congestion controller,
+    /// the pacer and the in-flight accounting start over under `generation`, so a packet sent
+    /// before the restart no longer counts toward the new path's bytes in flight, its
+    /// congestion signals or its RTT samples. The MTU is kept: the black hole detector lowers it
+    /// if the new path is narrower, where restarting it would refuse every datagram above the
+    /// initial MTU until discovery has run again.
+    pub(super) fn restart_congestion(
+        &mut self,
+        generation: u64,
+        now: Instant,
+        config: &TransportConfig,
+    ) {
+        self.rtt = RttEstimator::new(config.initial_rtt);
+        self.congestion = config
+            .congestion_controller_factory
+            .clone()
+            .build(now, self.current_mtu());
+        self.pacing = Pacer::new(
+            config.initial_rtt,
+            self.congestion.initial_window(),
+            self.current_mtu(),
+            now,
+        );
+        self.in_flight = InFlight::new();
+        self.first_packet = None;
+        self.first_packet_after_rtt_sample = None;
+        self.generation = generation;
+    }
+
     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
     /// received enough data from the peer to permit sending `bytes_to_send` additional bytes
     pub(super) fn anti_amplification_blocked(&self, bytes_to_send: u64) -> bool {
