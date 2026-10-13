@@ -35,44 +35,62 @@ never cut on this repo without that bench.
 ## Upstream base (true git ancestry)
 
 `main` sits directly on upstream git history: upstream branch `0.11.x` at
-commit `d2cf48f1` (the `quinn-proto-0.11.17` line, which also contains quinn
-0.11.11 via tag `quinn-0.11.11`), followed by one fork commit per concern.
+commit `8192ed39` (tag `quinn-proto-0.11.19`, which also carries quinn
+0.11.12 from tag `quinn-0.11.12`), followed by one fork commit per concern.
 `git log upstream/0.11.x..main` therefore lists exactly the fork surface, and moving to a newer upstream 0.11.x state is a plain `git rebase`
 (or merge) instead of a tree reconstruction.
 
-### What the move from `33ce0c21` to `d2cf48f1` brought in
+### What the move from `d2cf48f1` to `8192ed39` brought in
 
-33 upstream commits, of which four change behaviour Warren depends on:
+19 upstream commits (quinn-proto 0.11.18 and 0.11.19, quinn 0.11.12). They
+clear the three RustSec advisories that the advisory watch matched against
+the old base version:
 
-- **`dcb9eabe`, the black-hole detector fixes** (upstream #2799, backporting
-  #2792 and #2400, closing #2791). On the pre-backport code a bulk transfer of
-  uniformly full-size packets re-arms the detector on every loss burst: an
-  equal-size delivery returned early from `on_non_probe_acked` without
-  advancing `largest_post_loss_packet`, so bursts that preceded it stayed
-  suspicious, and `finish_loss_burst`'s strict comparisons kept judging
-  1200-byte bursts suspicious once the connection had already fallen to
-  `min_mtu`. The reporter measured thousands of detections per connection and
-  a PMTU pinned at 1200 for the rest of the transfer, against 1452 with the
-  fixes. That is the symptom the Warren field report
-  (`incidents/2026-09-12-bufferbloat-fixed-probe-budget-reconnect-storm.md`)
-  measured on a member's line: PMTU parked at 1200 to 1230 on a path whose
-  real PMTU was 1492. Every consumer pinning `fork.12` or older carries the
-  bug; this re-sync is what removes it.
-- **`f650e0f2`**, a double subtraction of `payload_bytes` when evicting
-  outgoing datagrams, and the `DatagramBuffer` rework around it: the send and
-  receive queues now charge per-entry bookkeeping, not payload alone, so a
-  queue of empty datagrams is bounded by memory rather than by a byte count it
-  never moves. The fork's FQ-CoDel queue carries the same accounting
-  (`QUEUED_OVERHEAD`).
-- **`912d648e`**, ACKs bundled into packets that already carry DATAGRAM or
-  STREAM frames, which is every tunnel packet.
-- **`73e168d9`**, pacing state reset on path reset.
+- **`4c929554`** (upstream PR #2868): RUSTSEC-2026-0338, a remote peer can
+  panic quinn-proto with zero-length STREAM frames during unordered reads
+  (empty ranges in `RangeSet::replace`).
+- **`9a66201e`** (upstream PR #2868): RUSTSEC-2026-0340, a peer's minimum ACK
+  delay can panic quinn-proto when ACK_FREQUENCY transmission is enabled.
+- RUSTSEC-2026-0343 (upstream PR #2806, the double subtraction when evicting
+  outgoing datagrams) was already fixed in the previous base by `f650e0f2`,
+  and the fork's own send queue replaces that buffer; the watch matched it on
+  the base version number alone.
+
+`3c0adcc0` and `abca0089` bound stream send memory (abandoned send buffers
+released on reset, send windows budgeted against retained storage).
+
+One upstream behaviour change lands on a fork delta: **`8ada074d`** pads
+Initial datagrams to the configured `min_mtu` instead of the fixed 1200 bytes,
+on the same two `pad_to` calls as delta 1. The resolution pads to the larger
+of `initial_datagram_min_size` and upstream's `min_mtu`, clamped to the path
+MTU, so the knob at its default reproduces upstream's new behaviour and a
+Warren floor above `min_mtu` still wins. The same commit's test
+`min_mtu_does_not_pad_application_data` calls the datagram `send` without the
+`now` argument the fork's AQM queue takes; the call site is adapted inside the
+datagram send-queue commit.
+
+The rest are upstream correctness fixes: a potential CID leak in
+`connect()`, state cleanup when a transmit fails, a stale waker in blocked
+readers, cancellation-safe `handshake_data`, `MAX_STREAM_DATA` checked against
+the limit on remote bidi streams, close-frame space reserved after large
+Initial headers, Initial tokens that would prevent packet construction
+rejected, `wait_idle` woken when the endpoint driver drops, and
+semver-compatible dependency updates. The two `udp` commits (`6862d3dc`,
+`8192ed39`) touch the 0.5 line that the overlay below replaces, so they do not
+reach the fork.
 
 One deliberate mix: `quinn-udp` is not the 0.5.15 of branch 0.11.x but an
 overlay of tag `quinn-udp-0.6.1` (commit `38c036ad`, upstream **main**
 lineage), because the Apple fast-datapath work targets the udp 0.6 line. The
 overlay is its own commit and brings the `[workspace.lints]` table that udp
-0.6.1 expects into the 0.11.x workspace root.
+0.6.1 expects into the 0.11.x workspace root. The overlay was not moved to
+`quinn-udp-0.6.3` in the `8192ed39` re-sync: 0.6.3 carries upstream's own
+Apple fast datapath (`apple_fast.rs`, superseding delta 4) and splits
+`unix.rs` into a `linux.rs` backend, so moving to it is a datapath change of
+its own, with its own A/B bench and an Apple and Windows validation. Upstream
+fixes it would bring include the receive-error handling ahead of truncation
+flags (`462865a6`) and three cmsg aliasing fixes; no RustSec advisory is filed
+against quinn-udp.
 
 History note: up to the `v0.11.15-fork.*` tags the repo was an orphan tree
 with no upstream ancestry. That history stays reachable through the released
@@ -309,15 +327,14 @@ the primary upgrade path is now a plain `git rebase`.
 
 - `upstream-initial-fragmentation.patch`: the two Initial-fragmentation knobs
   plus their pair tests, the only delta proposed for upstream (see
-  `UPSTREAM-PR.md`). Applies clean on upstream `0.11.x` commit `d2cf48f1`;
+  `UPSTREAM-PR.md`). Applies clean on upstream `0.11.x` commit `8192ed39`;
   a submission against upstream **main** needs a manual port (main has moved
   to the 0.12 line).
 - `fork-mtud-probe-loss.patch`: delta 9, the probe-loss discriminant in
   `quinn-proto/src/connection/mtud.rs` plus its one call site in
   `connection/mod.rs` (fork-local, two tests included).
 - `fork-gso.patch`: GSO transmit sizing in `quinn/src/connection.rs`
-  (fork-local). Applies on tag `quinn-0.11.11` content, unchanged through
-  `d2cf48f1`.
+  (fork-local). Applies on the quinn content of `8192ed39`.
 - `fork-windows-sockbuf.patch`: kernel socket-buffer auto-sizing at socket
   creation, `quinn-udp/src/windows.rs` plus the matching `unix.rs` hunk
   (fork-local). Applies on tag `quinn-udp-0.6.1`.
@@ -330,7 +347,7 @@ the primary upgrade path is now a plain `git rebase`.
   in the order listed here and fix the manifest context by hand.
 
 - `upstream-bbr-startup-cwnd.patch`: the BBR repair fixes (delta 5) plus
-  their regression tests. Applies clean on `d2cf48f1`; the `pub(crate)`
+  their regression tests. Applies clean on `8192ed39`; the `pub(crate)`
   widening of `RttEstimator::new` the tests need landed upstream in
   `33ce0c21`, so it is no longer part of the fork delta. The same one-token
   STARTUP bug is present on upstream main.

@@ -1,8 +1,8 @@
 diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
-index 9f102abc..53f76750 100644
+index ee2b77e4..03d94a9a 100644
 --- a/quinn-proto/src/connection/mod.rs
 +++ b/quinn-proto/src/connection/mod.rs
-@@ -1851,7 +1851,11 @@ impl Connection {
+@@ -1844,7 +1844,11 @@ impl Connection {
          if let Some(packet) = lost_mtu_probe {
              let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
              self.remove_in_flight(&info);
@@ -16,7 +16,7 @@ index 9f102abc..53f76750 100644
          }
      }
 diff --git a/quinn-proto/src/connection/mtud.rs b/quinn-proto/src/connection/mtud.rs
-index 0893b294..54ef3dcb 100644
+index 0893b294..73adcda2 100644
 --- a/quinn-proto/src/connection/mtud.rs
 +++ b/quinn-proto/src/connection/mtud.rs
 @@ -133,9 +133,15 @@ impl MtuDiscovery {
@@ -37,7 +37,7 @@ index 0893b294..54ef3dcb 100644
          }
      }
  
-@@ -255,9 +261,28 @@ impl EnabledMtuDiscovery {
+@@ -255,9 +261,26 @@ impl EnabledMtuDiscovery {
      }
  
      /// Called when the in-flight MTU probe was lost
@@ -45,13 +45,11 @@ index 0893b294..54ef3dcb 100644
 +    ///
 +    /// `path_lossy` means ordinary packets were declared lost in the same
 +    /// detection pass, so the path is dropping traffic of every size and the
-+    /// probe's loss carries no information about the probed size. RFC 8899
-+    /// section 3, requirement 4: "The PL is REQUIRED to be robust in the case
-+    /// where probe packets are lost due to other reasons (including link
-+    /// transmission error, congestion)." Counting such a loss as a failure
-+    /// anyway lowers the binary search's upper bound on every congestion drop,
-+    /// so it converges below the real PMTU while retransmitting the probe for
-+    /// as long as the link stays congested.
++    /// probe's loss carries no information about the probed size. Counting it
++    /// as a failure anyway is what RFC 8899 warns against: the binary search
++    /// lowers its upper bound on every congestion drop and converges far below
++    /// the real PMTU, while retransmitting the probe for as long as the link
++    /// stays congested.
 +    ///
 +    /// The round is therefore ENDED with the MTU left exactly where it was, to
 +    /// be retried at the next activation. Ending it rather than re-probing is
@@ -67,7 +65,7 @@ index 0893b294..54ef3dcb 100644
              state.in_flight_probe = None;
              state.lost_probe_count += 1;
          }
-@@ -566,7 +591,7 @@ mod tests {
+@@ -566,7 +589,7 @@ mod tests {
              if probe_size <= link_payload_size_limit {
                  mtud.on_acked(SpaceId::Data, probe_pn, probe_size);
              } else {
@@ -76,7 +74,7 @@ index 0893b294..54ef3dcb 100644
              }
          }
          probed_sizes
-@@ -599,6 +624,132 @@ mod tests {
+@@ -599,6 +622,132 @@ mod tests {
          assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 1);
      }
  
@@ -209,7 +207,7 @@ index 0893b294..54ef3dcb 100644
      #[test]
      fn black_hole_detector_ignores_empty_burst() {
          let mut mtud = default_mtud();
-@@ -696,7 +847,7 @@ mod tests {
+@@ -696,7 +845,7 @@ mod tests {
              let probe_size = mtud.poll_transmit(Instant::now(), i);
              assert!(probe_size.is_some(), "no probe returned for packet {i}");
  
@@ -218,7 +216,7 @@ index 0893b294..54ef3dcb 100644
              probe_size.unwrap()
          });
  
-@@ -835,7 +986,7 @@ mod tests {
+@@ -835,7 +984,7 @@ mod tests {
                  );
                  // assert!(mtud.current_mtu > previous_max_size);
              } else {

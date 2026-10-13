@@ -1,8 +1,8 @@
 diff --git a/quinn-proto/src/config/transport.rs b/quinn-proto/src/config/transport.rs
-index 7cd7ae19..101503e1 100644
+index 18d35f85..c90801b0 100644
 --- a/quinn-proto/src/config/transport.rs
 +++ b/quinn-proto/src/config/transport.rs
-@@ -869,6 +869,7 @@ pub struct DatagramAqmConfig {
+@@ -876,6 +876,7 @@ pub struct DatagramAqmConfig {
      pub(crate) target: Duration,
      pub(crate) interval: Duration,
      pub(crate) flow_queues: usize,
@@ -10,7 +10,7 @@ index 7cd7ae19..101503e1 100644
  }
  
  impl DatagramAqmConfig {
-@@ -905,6 +906,27 @@ impl DatagramAqmConfig {
+@@ -912,6 +913,27 @@ impl DatagramAqmConfig {
          self.flow_queues = value.max(1);
          self
      }
@@ -38,7 +38,7 @@ index 7cd7ae19..101503e1 100644
  }
  
  impl Default for DatagramAqmConfig {
-@@ -913,6 +935,7 @@ impl Default for DatagramAqmConfig {
+@@ -920,6 +942,7 @@ impl Default for DatagramAqmConfig {
              target: Duration::from_millis(15),
              interval: Duration::from_millis(100),
              flow_queues: 1024,
@@ -744,7 +744,7 @@ index 69883265..bc669792 100644
      ///
      /// The four `ecn_*` counters record the ECN codepoint distribution of the
 diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
-index edd38055..8f2fb4b4 100644
+index 1caabdb9..72e53dde 100644
 --- a/quinn-proto/src/tests/mod.rs
 +++ b/quinn-proto/src/tests/mod.rs
 @@ -2480,6 +2480,57 @@ fn datagram_send_buffer_space_preserves_queued_datagrams() {

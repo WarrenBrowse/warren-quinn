@@ -1,8 +1,8 @@
 diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
-index 53f76750..46a9d051 100644
+index 03d94a9a..a53ca9f4 100644
 --- a/quinn-proto/src/connection/mod.rs
 +++ b/quinn-proto/src/connection/mod.rs
-@@ -1505,6 +1505,11 @@ impl Connection {
+@@ -1498,6 +1498,11 @@ impl Connection {
          if ack.largest >= self.spaces[space].next_packet_number {
              return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
          }
@@ -14,7 +14,7 @@ index 53f76750..46a9d051 100644
          let new_largest = {
              let space = &mut self.spaces[space];
              if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
-@@ -1514,6 +1519,7 @@ impl Connection {
+@@ -1507,6 +1512,7 @@ impl Connection {
                      // haven't sent. At worst, that will result in us spuriously reducing the
                      // congestion window.
                      space.largest_acked_packet_sent = info.time_sent;
@@ -22,7 +22,7 @@ index 53f76750..46a9d051 100644
                  }
                  true
              } else {
-@@ -1569,7 +1575,7 @@ impl Connection {
+@@ -1562,7 +1568,7 @@ impl Connection {
              self.spaces[space].largest_acked_packet,
          );
  
@@ -31,7 +31,7 @@ index 53f76750..46a9d051 100644
              let ack_delay = if space != SpaceId::Data {
                  Duration::from_micros(0)
              } else {
-@@ -1645,10 +1651,13 @@ impl Connection {
+@@ -1638,10 +1644,13 @@ impl Connection {
      // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
      // high-latency handshakes
      fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
@@ -47,7 +47,7 @@ index 53f76750..46a9d051 100644
              self.path.congestion.on_ack(
                  now,
                  info.time_sent,
-@@ -3146,6 +3155,25 @@ impl Connection {
+@@ -3139,6 +3148,25 @@ impl Connection {
          self.ping();
      }
  
@@ -117,7 +117,7 @@ index 1488575c..37b3a136 100644
      /// received enough data from the peer to permit sending `bytes_to_send` additional bytes
      pub(super) fn anti_amplification_blocked(&self, bytes_to_send: u64) -> bool {
 diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
-index 8f2fb4b4..3f4caaa0 100644
+index 72e53dde..a3dfea15 100644
 --- a/quinn-proto/src/tests/mod.rs
 +++ b/quinn-proto/src/tests/mod.rs
 @@ -38,6 +38,8 @@ use util::*;
@@ -460,7 +460,7 @@ index 00000000..38593de4
 +    );
 +}
 diff --git a/quinn-proto/src/tests/util.rs b/quinn-proto/src/tests/util.rs
-index fd61e611..1f96bfd8 100644
+index 01189eeb..6a2bdec1 100644
 --- a/quinn-proto/src/tests/util.rs
 +++ b/quinn-proto/src/tests/util.rs
 @@ -39,6 +39,10 @@ pub(super) struct Pair {
@@ -517,7 +517,7 @@ index fd61e611..1f96bfd8 100644
                      ecn,
                      buffer.as_ref().into(),
                  ));
-@@ -278,6 +298,65 @@ impl Pair {
+@@ -282,6 +302,65 @@ impl Pair {
      }
  }
  
@@ -584,10 +584,10 @@ index fd61e611..1f96bfd8 100644
      fn default() -> Self {
          Self::new(Default::default(), server_config())
 diff --git a/quinn/src/connection.rs b/quinn/src/connection.rs
-index 69b59203..0b434b7e 100644
+index b256c263..c10a24a0 100644
 --- a/quinn/src/connection.rs
 +++ b/quinn/src/connection.rs
-@@ -1135,9 +1135,15 @@ impl State {
+@@ -1144,9 +1144,15 @@ impl State {
          loop {
              match self.conn_events.poll_recv(cx) {
                  Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
@@ -604,7 +604,7 @@ index 69b59203..0b434b7e 100644
                  }
                  Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
                      self.inner.handle_event(event);
-@@ -1384,3 +1390,77 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 80;
+@@ -1393,3 +1399,77 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 80;
  // under the kernel UDP_MAX_SEGMENTS=64 ceiling. Total GSO payload per
  // sendmsg must stay < u16::MAX (holds for MTU <= 1638 * 40 segments).
  const MAX_TRANSMIT_SEGMENTS: usize = 40;
