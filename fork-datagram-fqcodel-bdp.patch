@@ -15,7 +15,7 @@ index 0a299d03..b8ac2277 100644
  /// Global configuration for the endpoint, affecting all connections
  ///
 diff --git a/quinn-proto/src/config/transport.rs b/quinn-proto/src/config/transport.rs
-index 0220982f..7cd7ae19 100644
+index 5341c767..18d35f85 100644
 --- a/quinn-proto/src/config/transport.rs
 +++ b/quinn-proto/src/config/transport.rs
 @@ -54,6 +54,8 @@ pub struct TransportConfig {
@@ -27,7 +27,7 @@ index 0220982f..7cd7ae19 100644
      #[cfg(test)]
      pub(crate) deterministic_packet_numbers: bool,
  
-@@ -351,6 +353,52 @@ impl TransportConfig {
+@@ -358,6 +360,52 @@ impl TransportConfig {
          self
      }
  
@@ -80,7 +80,7 @@ index 0220982f..7cd7ae19 100644
      /// Whether to force every packet number to be used
      ///
      /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
-@@ -440,6 +488,8 @@ impl Default for TransportConfig {
+@@ -447,6 +495,8 @@ impl Default for TransportConfig {
              allow_spin: true,
              datagram_receive_buffer_size: Some(STREAM_RWND as usize),
              datagram_send_buffer_size: 1024 * 1024,
@@ -89,7 +89,7 @@ index 0220982f..7cd7ae19 100644
              #[cfg(test)]
              deterministic_packet_numbers: false,
  
-@@ -478,6 +528,8 @@ impl fmt::Debug for TransportConfig {
+@@ -485,6 +535,8 @@ impl fmt::Debug for TransportConfig {
              allow_spin,
              datagram_receive_buffer_size,
              datagram_send_buffer_size,
@@ -98,7 +98,7 @@ index 0220982f..7cd7ae19 100644
              #[cfg(test)]
                  deterministic_packet_numbers: _,
              congestion_controller_factory: _,
-@@ -515,6 +567,8 @@ impl fmt::Debug for TransportConfig {
+@@ -522,6 +574,8 @@ impl fmt::Debug for TransportConfig {
              .field("allow_spin", allow_spin)
              .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
              .field("datagram_send_buffer_size", datagram_send_buffer_size)
@@ -107,7 +107,7 @@ index 0220982f..7cd7ae19 100644
              // congestion_controller_factory not debug
              .field("enable_segmentation_offload", enable_segmentation_offload);
          if cfg!(feature = "qlog") {
-@@ -807,6 +861,107 @@ impl Default for MtuDiscoveryConfig {
+@@ -814,6 +868,107 @@ impl Default for MtuDiscoveryConfig {
      }
  }
  
@@ -1722,7 +1722,7 @@ index 411f827f..a41e0cab 100644
  }
  
 diff --git a/quinn-proto/src/connection/mod.rs b/quinn-proto/src/connection/mod.rs
-index 6aa2a82b..9f102abc 100644
+index 8eaebc4c..ee2b77e4 100644
 --- a/quinn-proto/src/connection/mod.rs
 +++ b/quinn-proto/src/connection/mod.rs
 @@ -48,7 +48,9 @@ use cid_state::CidState;
@@ -1736,7 +1736,7 @@ index 6aa2a82b..9f102abc 100644
  
  mod mtud;
  mod pacing;
-@@ -910,7 +912,7 @@ impl Connection {
+@@ -906,7 +908,7 @@ impl Connection {
                      && !can_send.acks
                      && can_send.other
                      && (buf_capacity - builder.datagram_start) == self.path.current_mtu() as usize
@@ -1745,7 +1745,7 @@ index 6aa2a82b..9f102abc 100644
                  "SendableFrames was {can_send:?}, but only ACKs have been written"
              );
              pad_datagram |= sent.requires_padding;
-@@ -3420,7 +3422,13 @@ impl Connection {
+@@ -3413,7 +3415,13 @@ impl Connection {
          // DATAGRAM
          let mut sent_datagrams = false;
          while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
@@ -1760,7 +1760,7 @@ index 6aa2a82b..9f102abc 100644
                  true => {
                      sent_datagrams = true;
                      sent.non_retransmits = true;
-@@ -3793,7 +3801,7 @@ impl Connection {
+@@ -3786,7 +3794,7 @@ impl Connection {
                  .as_ref()
                  .is_some_and(|(_, x)| x.challenge_pending)
              || !self.path_responses.is_empty()
@@ -1865,7 +1865,7 @@ index 5982b690..cd1532b8 100644
  
  pub mod crypto;
 diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
-index 6aa2d45c..edd38055 100644
+index 55b430db..1caabdb9 100644
 --- a/quinn-proto/src/tests/mod.rs
 +++ b/quinn-proto/src/tests/mod.rs
 @@ -28,6 +28,7 @@ use super::*;
@@ -2212,7 +2212,18 @@ index 6aa2d45c..edd38055 100644
              .unwrap();
      }
      pair.drive();
-@@ -3855,11 +3929,12 @@ fn pad_to_mtu() {
+@@ -3876,8 +3950,9 @@ fn min_mtu_does_not_pad_application_data() {
+     let (client_ch, server_ch) = pair.connect_with(config);
+ 
+     let message = Bytes::from_static(b"hello");
++    let now = pair.time;
+     pair.client_datagrams(client_ch)
+-        .send(message.clone(), false)
++        .send(message.clone(), false, now)
+         .unwrap();
+     pair.client.drive(pair.time, pair.server.addr);
+     assert_eq!(pair.client.outbound.len(), 1);
+@@ -4061,11 +4136,12 @@ fn pad_to_mtu() {
      // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
      const LEN_1: usize = 800;
      const LEN_2: usize = 600;
@@ -2227,7 +2238,7 @@ index 6aa2d45c..edd38055 100644
          .unwrap();
      pair.client.drive(pair.time, pair.server.addr);
  
-@@ -3914,8 +3989,9 @@ fn large_datagram_with_acks() {
+@@ -4120,8 +4196,9 @@ fn large_datagram_with_acks() {
  
      let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
      let msg = Bytes::from(vec![0; max_size]);
@@ -2238,7 +2249,7 @@ index 6aa2d45c..edd38055 100644
          .unwrap();
      let initial_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
      pair.drive();
-@@ -3938,9 +4014,10 @@ fn voluntary_ack_with_large_datagrams() {
+@@ -4144,9 +4221,10 @@ fn voluntary_ack_with_large_datagrams() {
      // larger ACKs occur
      const COUNT: usize = 256;
      for _ in 0..COUNT {
@@ -2250,7 +2261,7 @@ index 6aa2d45c..edd38055 100644
              .unwrap();
          pair.drive();
      }
-@@ -3966,7 +4043,11 @@ fn path_changes_unblock_oversized_datagrams() {
+@@ -4172,7 +4250,11 @@ fn path_changes_unblock_oversized_datagrams() {
          let empty_space = pair.server_datagrams(server_ch).send_buffer_space();
          let data = Bytes::from(vec![42; old_max]);
          loop {
@@ -2263,7 +2274,7 @@ index 6aa2d45c..edd38055 100644
                  Ok(()) => {}
                  Err(SendDatagramError::Blocked(_)) => break,
                  Err(error) => panic!("unexpected send error: {error}"),
-@@ -4013,8 +4094,9 @@ fn path_changes_unblock_oversized_datagrams() {
+@@ -4219,8 +4301,9 @@ fn path_changes_unblock_oversized_datagrams() {
          );
  
          let small = Bytes::from_static(b"small");
@@ -2274,7 +2285,7 @@ index 6aa2d45c..edd38055 100644
              .unwrap();
          pair.drive();
          assert_eq!(pair.client_datagrams(client_ch).recv(), Some(small));
-@@ -4043,9 +4125,10 @@ fn oversized_datagrams_trigger_unblock() {
+@@ -4249,9 +4332,10 @@ fn oversized_datagrams_trigger_unblock() {
      let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
      let data = vec![0; max_size];
      loop {
@@ -2286,7 +2297,7 @@ index 6aa2d45c..edd38055 100644
          {
              Ok(_) => {}
              Err(SendDatagramError::Blocked(_)) => {
-@@ -4060,9 +4143,10 @@ fn oversized_datagrams_trigger_unblock() {
+@@ -4266,9 +4350,10 @@ fn oversized_datagrams_trigger_unblock() {
      // Drive the pair until black hole detection kicks in and the path MTU is adjusted.
      while pair.step() {
          let err = loop {
@@ -2298,7 +2309,7 @@ index 6aa2d45c..edd38055 100644
              {
                  break e;
              }
-@@ -4094,7 +4178,7 @@ fn oversized_datagrams_trigger_unblock() {
+@@ -4300,7 +4385,7 @@ fn oversized_datagrams_trigger_unblock() {
  
      assert_eq!(
          pair.client_datagrams(client_ch).send_buffer_space(),
@@ -2307,7 +2318,7 @@ index 6aa2d45c..edd38055 100644
          "expected the send buffer to be empty after too large datagrams were dropped",
      );
      match pair.client_conn_mut(client_ch).poll() {
-@@ -4110,8 +4194,9 @@ fn ack_bundled_with_datagrams() {
+@@ -4316,8 +4401,9 @@ fn ack_bundled_with_datagrams() {
      let (client_ch, server_ch) = pair.connect_with(client_config_with_deterministic_pns());
  
      // Send packet from client and then send from server. the packet from server should include ACKs
@@ -2318,7 +2329,7 @@ index 6aa2d45c..edd38055 100644
          .unwrap();
      pair.drive_client();
      pair.drive_server();
-@@ -4120,8 +4205,9 @@ fn ack_bundled_with_datagrams() {
+@@ -4326,8 +4412,9 @@ fn ack_bundled_with_datagrams() {
      let server_tx_packets_before_datagram =
          pair.server_conn_mut(server_ch).stats().udp_tx.datagrams;
  
@@ -2330,7 +2341,7 @@ index 6aa2d45c..edd38055 100644
      pair.drive_server();
  
 diff --git a/quinn/src/connection.rs b/quinn/src/connection.rs
-index 82a3171c..69b59203 100644
+index be79c6da..b256c263 100644
 --- a/quinn/src/connection.rs
 +++ b/quinn/src/connection.rs
 @@ -28,8 +28,8 @@ use crate::{
@@ -2344,7 +2355,7 @@ index 82a3171c..69b59203 100644
  };
  
  /// In-progress connection attempt future
-@@ -451,7 +451,43 @@ impl Connection {
+@@ -460,7 +460,43 @@ impl Connection {
              return Err(SendDatagramError::ConnectionLost(x.clone()));
          }
          use proto::SendDatagramError::*;
@@ -2389,7 +2400,7 @@ index 82a3171c..69b59203 100644
              Ok(()) => {
                  conn.wake();
                  Ok(())
-@@ -863,7 +899,7 @@ impl Future for SendDatagram<'_> {
+@@ -872,7 +908,7 @@ impl Future for SendDatagram<'_> {
          match state
              .inner
              .datagrams()
