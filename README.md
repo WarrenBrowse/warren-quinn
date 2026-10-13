@@ -42,8 +42,12 @@ with the out-of-tunnel control moving more than either.
 `main` sits directly on upstream git history: upstream branch `0.11.x` at
 commit `8192ed39` (tag `quinn-proto-0.11.19`, which also carries quinn
 0.11.12 from tag `quinn-0.11.12`), followed by one fork commit per concern.
-`git log upstream/0.11.x..main` therefore lists exactly the fork surface, and moving to a newer upstream 0.11.x state is a plain `git rebase`
-(or merge) instead of a tree reconstruction.
+`git log upstream/0.11.x..main` therefore lists only fork commits, and moving to a newer upstream 0.11.x state is a plain `git rebase`
+or merge instead of a tree reconstruction. `main` is protected against
+force-push since fork.16, so the move onto `8192ed39` lands as a merge of the
+upstream tag whose tree is the rebased fork: the one-commit-per-delta form of
+that state is the branch `rebased/fork.16`, which the patch files below are
+generated from.
 
 ### What the move from `d2cf48f1` to `8192ed39` brought in
 
@@ -326,7 +330,8 @@ old tags are unaffected; only `main` was rebuilt.
 ## Patch files (portable form of the deltas)
 
 Each fork delta is also committed as an isolated patch at the repo root,
-regenerated from the rebased history (each file is the exact diff of its fork
+regenerated from the rebased history, branch `rebased/fork.16` since fork.16
+(each file is the exact diff of its fork
 commit). They are the fallback when upstream refactors force a manual port;
 the primary upgrade path is now a plain `git rebase`.
 
