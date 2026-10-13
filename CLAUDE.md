@@ -30,7 +30,7 @@ that diverges from upstream is a line someone re-resolves at the next re-sync.
   control-plane concept. If a change can live in `warrenguard`, it lives there.
 - **The delta is deliberately small and enumerable**: the authoritative
   per-delta list is README.md section "Deltas vs upstream" (10 deltas as of
-  fork.15: the Initial-fragmentation knobs, GSO transmit sizing, socket-buffer
+  fork.16: the Initial-fragmentation knobs, GSO transmit sizing, socket-buffer
   autosizing, the Apple fast datapath, the BBR repair fixes, the FQ-CoDel
   datagram send-queue AQM, the BDP-adaptive send buffer, the inner-ECN
   counters, the probe-loss discriminant, and the congestion restart on a

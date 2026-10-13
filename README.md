@@ -4,8 +4,8 @@
 
 # warren-quinn
 
-A thin fork of [quinn](https://github.com/quinn-rs/quinn) (quinn 0.11.11,
-quinn-proto 0.11.17, quinn-udp 0.6.1) carrying a small set of transport
+A thin fork of [quinn](https://github.com/quinn-rs/quinn) (quinn 0.11.12,
+quinn-proto 0.11.19, quinn-udp 0.6.1) carrying a small set of transport
 deltas, published as renamed crates so downstreams inherit them transitively
 (no `[patch.crates-io]` required):
 
@@ -17,12 +17,12 @@ The lib names are unchanged, so consumers depend with a package rename and keep
 `use quinn` untouched:
 
 ```toml
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.17-fork.15", package = "warren-quinn" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.19-fork.16", package = "warren-quinn" }
 ```
 
 The fork level `N` in `-fork.<N>` is repo-wide: all three crates bump it in
-lockstep (quinn `0.11.11-fork.15`, quinn-proto `0.11.17-fork.15`, quinn-udp
-`0.6.1-fork.15`).
+lockstep (quinn `0.11.12-fork.16`, quinn-proto `0.11.19-fork.16`, quinn-udp
+`0.6.1-fork.16`).
 
 `v0.11.16-fork.8` was cut only after a Hetzner A/B bench cleared the behaviour
 changes folded in from upstream 0.11.15/0.11.16, chiefly the **BBR RNG switch
@@ -31,6 +31,11 @@ fast-convergence fix. Tunnel TCP came back flat within ±0.5% against the
 `fork.6` baseline on the same hardware (report:
 `warren-core/bench/results/2026-07-13_QUINN-FORK8_ab-hetzner.md`). A tag is
 never cut on this repo without that bench.
+
+`v0.11.19-fork.16`, the re-sync onto upstream quinn-proto 0.11.19, cleared
+the same gate on 2026-10-13: six interleaved blocks on two ccx23 boxes, tunnel
+TCP up 427.4 to 429.3 Mbit/s (+0.4%) and down 752.6 to 771.0 Mbit/s (+2.5%),
+with the out-of-tunnel control moving more than either.
 
 ## Upstream base (true git ancestry)
 

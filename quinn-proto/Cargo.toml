@@ -3,9 +3,9 @@ name = "warren-quinn-proto"
 # The `-fork.<N>` pre-release suffix locks the workspace `[patch.crates-io]`
 # entry to this fork. The fork level N is repo-wide, bumped in lockstep across
 # the three crates on every fork-side patch so a stale `Cargo.lock` cannot
-# silently drag the upstream crate back in. Base: upstream quinn-proto 0.11.17
+# silently drag the upstream crate back in. Base: upstream quinn-proto 0.11.19
 # (branch 0.11.x).
-version = "0.11.17-fork.15"
+version = "0.11.19-fork.16"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
