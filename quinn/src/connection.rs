@@ -149,8 +149,11 @@ impl Connecting {
         // Taking &mut self allows us to use a single oneshot channel rather than dealing with
         // potentially many tasks waiting on the same event. It's a bit of a hack, but keeps things
         // simple.
-        if let Some(x) = self.handshake_data_ready.take() {
+        if let Some(x) = self.handshake_data_ready.as_mut() {
             let _ = x.await;
+            // Once the data is ready, apply state changes. This prevents a panic due to
+            // inconsistent state when retrying a call to `handshake_data`.
+            self.handshake_data_ready = None;
         }
         let conn = self.conn.as_ref().unwrap();
         let inner = conn.state.lock("handshake");
@@ -264,7 +267,13 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = conn.drive_transmit(cx).inspect_err(|_| {
+            // Transmit failed, so close the connection and clean state before returning the error.
+            if !conn.inner.is_closed() {
+                conn.implicit_close(&self.conn.shared);
+            }
+        })?;
+
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
