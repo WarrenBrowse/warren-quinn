@@ -17,12 +17,12 @@ The lib names are unchanged, so consumers depend with a package rename and keep
 `use quinn` untouched:
 
 ```toml
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.19-fork.16", package = "warren-quinn" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn", tag = "v0.11.19-fork.17", package = "warren-quinn" }
 ```
 
 The fork level `N` in `-fork.<N>` is repo-wide: all three crates bump it in
-lockstep (quinn `0.11.12-fork.16`, quinn-proto `0.11.19-fork.16`, quinn-udp
-`0.6.1-fork.16`).
+lockstep (quinn `0.11.12-fork.17`, quinn-proto `0.11.19-fork.17`, quinn-udp
+`0.6.1-fork.17`).
 
 `v0.11.16-fork.8` was cut only after a Hetzner A/B bench cleared the behaviour
 changes folded in from upstream 0.11.15/0.11.16, chiefly the **BBR RNG switch
@@ -36,6 +36,13 @@ never cut on this repo without that bench.
 the same gate on 2026-10-13: six interleaved blocks on two ccx23 boxes, tunnel
 TCP up 427.4 to 429.3 Mbit/s (+0.4%) and down 752.6 to 771.0 Mbit/s (+2.5%),
 with the out-of-tunnel control moving more than either.
+
+`v0.11.19-fork.17` adds one upstream security backport to the quinn-udp
+overlay and nothing else (see "Upstream backports on the quinn-udp overlay"
+below). It was cut without the A/B bench because the changed function,
+`recv_single`, is not on the benched datapath: the Linux exits and clients
+receive through `recvmmsg`, and Apple hosts through `recvmsg_x` whenever the
+fast datapath resolves.
 
 ## Upstream base (true git ancestry)
 
@@ -97,9 +104,29 @@ overlay is its own commit and brings the `[workspace.lints]` table that udp
 Apple fast datapath (`apple_fast.rs`, superseding delta 4) and splits
 `unix.rs` into a `linux.rs` backend, so moving to it is a datapath change of
 its own, with its own A/B bench and an Apple and Windows validation. Upstream
-fixes it would bring include the receive-error handling ahead of truncation
-flags (`462865a6`) and three cmsg aliasing fixes; no RustSec advisory is filed
-against quinn-udp.
+fixes it would bring include three cmsg aliasing fixes (soundness, no
+advisory); the receive-error handling ahead of truncation flags (`462865a6`)
+was backported on its own in fork.17 because an advisory was filed against it
+(below).
+
+### Upstream backports on the quinn-udp overlay
+
+Fixes taken from a later quinn-udp release onto the 0.6.1 overlay, without
+moving the overlay. They are upstream code, not fork deltas: the next overlay
+move to a quinn-udp release that contains them drops them.
+
+- **`462865a6`** (quinn-udp 0.6.3, GHSA-6pp4-4cxf-xf88, high): after a
+  datagram larger than the receive buffer, `recv_single` kept `MSG_TRUNC`
+  from the previous call and looped on `recvmsg` returning `EAGAIN`, pegging a
+  core until another datagram arrived. Any host that can reach the socket can
+  trigger it with one oversized UDP datagram. `recv_single` is the receive
+  path on Apple when the fast datapath does not resolve (and always without
+  the `fast-apple-datapath` feature), and on the BSDs and illumos. Linux uses
+  `recvmmsg` and was never affected. Fork.17 ships the upstream fix and its
+  two tests; `recv_single_skips_truncated_datagrams` sets a read timeout
+  instead of a non-blocking socket, because on macOS loopback the second
+  datagram is not always queued when the first is skipped (5 failures in 25
+  runs as upstream wrote it).
 
 History note: up to the `v0.11.15-fork.*` tags the repo was an orphan tree
 with no upstream ancestry. That history stays reachable through the released
